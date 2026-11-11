@@ -8,8 +8,9 @@ serverless, classic job clusters and Lakeflow Declarative Pipelines.
 >
 > Status: **planning**. This repo holds design documents only; no code yet.
 > See [docs/design.md](docs/design.md) for the design and roadmap, and
-> [docs/features.md](docs/features.md) for every feature with an example, and
-> [docs/review-brief.md](docs/review-brief.md) for open decisions and questions.
+> [docs/features.md](docs/features.md) for every feature with an example,
+> [docs/review-brief.md](docs/review-brief.md) for open decisions and questions, and
+> [docs/governance.md](docs/governance.md) for the proposed ownership, change-control and rollout model.
 
 ## The idea in 30 seconds (proposed API)
 

@@ -60,6 +60,7 @@ Adoption is the main design constraint. A team gets value with zero lines of cod
 | D15 | In LDP, severity and action are separate: `error` → fail the update; dropping rows needs an explicit opt-in; aggregate checks are observational | Proposed (new, A2/A3) | Reusing a suite must never quietly turn "reject" into "delete" | — |
 | D16 | Gating uses write-audit-publish: validate the exact Delta version that will be published | Proposed (new, A14) | Validating a DataFrame and then writing it can validate data that differs from what gets published | Teams find a staging step too heavy; it could stay opt-in |
 | D12 | Naming: install `lakehouse-runledger`, import `lakehouse_runledger`; the CLI, `rl_` tables and `RUNLEDGER_*` env vars use the short name | Proposed | Short names where people type or query them | — |
+| D17 | Governance by default: named roles, three change classes with contract snapshot tests, one pinned version per target rolled out in rings, criticality tiers checked in CI, a grants model, and a scorecard view ([governance.md](governance.md)) | Proposed (new) | A small team can't review hundreds of jobs by hand; standards must live in the template, the manifest and CI | A second team with separate permissions adopts runledger; owners outgrow a handful of alert destinations |
 
 ---
 
@@ -149,6 +150,10 @@ Each question says what changes in the plan depending on the answer.
 | Q-G5 | Is outbound network access from jobs allowed (for future webhooks)? | Whether in-task webhooks are viable or alerts must stay in Databricks |
 | Q-G6 | With shared `rl_*` tables, every producing job needs `MODIFY`, so it can change other teams' rows (claim C7). Is that acceptable, or do we need per-team schemas with union views? | Grants model and the bundle template layout |
 
+[governance.md](governance.md) proposes answers to Q-G3, Q-G4, Q-G6 and Q-O3, and adds its own
+questions G-Q1 to G-Q6 (roles, job ownership, number of bundles, default criticality, kill
+switches, rule approvers).
+
 ### Alerting and operations
 
 | # | Question | Why it matters |
@@ -225,6 +230,7 @@ These are order-of-magnitude numbers for one experienced engineer, assuming the 
 - [ ] D11 runtime floor confirmed
 - [ ] MVP scope confirmed or trimmed
 - [ ] Pilot pipelines named
+- [ ] Governance model (D17, [governance.md](governance.md)) accepted or changed; product owner and maintainers named (G-Q1)
 - [ ] Spike owners and dates
 - [ ] Changes to make in design.md and features.md
 

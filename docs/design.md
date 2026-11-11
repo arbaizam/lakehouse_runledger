@@ -6,6 +6,8 @@
 > **Revised after review round 1** (an external architecture review). What changed and why is in
 > [review-brief.md §11](review-brief.md#11-review-round-1-what-changed); platform claims still to
 > settle are in [§12](review-brief.md#12-platform-claims-to-settle-in-the-design-review).
+> How the design is governed (owners, change classes, versions and rollout, job standards by
+> criticality, grants) is proposed in [governance.md](governance.md).
 
 ## Context
 
