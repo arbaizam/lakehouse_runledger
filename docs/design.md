@@ -3,10 +3,13 @@
 > **Status: planning.** Nothing is implemented. The plan is under review; see
 > [review-brief.md](review-brief.md) for the decision log, open questions and the review agenda.
 > Every feature, with an example, is listed in [features.md](features.md).
+> **Revised after review round 1** (an external architecture review). What changed and why is in
+> [review-brief.md §11](review-brief.md#11-review-round-1-what-changed); platform claims still to
+> settle are in [§12](review-brief.md#12-platform-claims-to-settle-in-the-design-review).
 
 ## Context
 
-`databricks_event_logger` (this repo) works, but it was built as a general event logger. Validation exists only as documentation recipes (about 10 lines of boilerplate per check). It writes to Delta with one synchronous INSERT per event. Its 40-column table buries validation evidence in a `metadata_json` string. It has no "started" event, so a crashed task leaves no trace. Its behaviour on serverless and Spark Connect was never checked.
+`databricks_event_logger` (the existing project) works, but it was built as a general event logger. Validation exists only as documentation recipes (about 10 lines of boilerplate per check). It writes to Delta with one synchronous INSERT per event. Its 40-column table buries validation evidence in a `metadata_json` string. It has no "started" event, so a crashed task leaves no trace. Its behaviour on serverless and Spark Connect was never checked.
 
 The goal is a **new, separate package** that is built around Databricks Workflows from the start. It treats data validation as a first-class feature. It works on serverless jobs, classic job clusters and Lakeflow Declarative Pipelines (LDP). Alerting uses Databricks itself (Delta tables → dashboard + SQL Alerts), with a seam for webhooks later.
 
@@ -39,13 +42,15 @@ No code, schema or module layout is carried over.
 1. **Append-only.** No MERGE or UPDATE on the hot path. Current state (running, finished, crashed) is worked out in views, so hundreds of concurrent tasks never conflict.
 2. **One table per grain.** Run lifecycle, log events, metrics, rule results and failing samples each get a typed table. Free-form data goes in `VARIANT`, never a JSON string.
 3. **Job parameters are the main source of context; auto-detection is the fallback.** Dynamic value references (`{{job.run_id}}` …) behave the same on serverless, classic and wheel tasks.
-4. **Buffered, batched, idempotent writes.** About one Delta commit per table per flush. `STARTED` is flushed immediately so a crash still leaves a row.
-5. **Validation compiles to as few Spark passes as possible.** Usually one `agg()` per dataset. A second pass happens only for failures.
+4. **Buffered, batched, idempotent, bounded writes.** About one Delta commit per table per flush. `STARTED` is flushed immediately so a crash still leaves a row. Logging may never block the job for longer than a fixed time budget.
+5. **Validation compiles to as few Spark passes as possible, without losing per-rule isolation.** Usually one `agg()` per dataset. Extra passes happen only for failures, or to isolate a rule that errors.
 6. **LDP is a separate mode.** No side-effect writes inside a pipeline. Rules become expectations, and the pipeline event log is ingested afterwards.
 7. **Core has no runtime dependencies and needs no Spark.** pyspark is imported lazily and never declared as a dependency, because the Databricks runtime provides it. A ruff `banned-api` rule forbids `sparkContext`/`_jvm`/`.rdd`/`py4j` outside one guarded module, which keeps Spark Connect compatibility.
 8. **Supported range:** Python 3.10+, DBR 15.4 LTS+ (needed for `VARIANT`), serverless env v2+.
 9. **Adoption comes first.** Every capability is reachable from a one-line or decorator form before the explicit API. Defaults need no configuration. When the tables don't exist yet, output falls back to stdout instead of failing. Error messages say how to fix the problem.
 10. **A missing run is a signal too.** A run manifest records which tasks are expected and when. A reconciler raises the alarm when they don't run, even if no library code ever executed.
+11. **Claim only what the evidence supports.** Missing telemetry is reported as a telemetry gap, not as a crash or a failure, unless other evidence confirms the cause.
+12. **Separate facts stay separate.** Whether code ran (execution status), whether data passed (quality status) and whether our records arrived (telemetry completeness) are three different fields, never merged into one status.
 
 ---
 
@@ -171,19 +176,20 @@ flowchart TB
   end
   subgraph UC["UC catalog.schema (rl_*)"]
     MAN[(rl_manifest<br/>expected tasks / SLAs / datasets)]
-    TR[(rl_task_runs<br/>STARTED · FINISHED · NEVER_STARTED …)]
+    TR[(rl_task_runs<br/>STARTED · FINISHED)]
     EV[(rl_events)]
     ME[(rl_metrics)]
     VR[(rl_validation_results)]
     VS[(rl_validation_samples<br/>restricted, 14d)]
+    OBS[(rl_slot_observations<br/>verdict · evidence · confidence)]
   end
   LIB --> TR & EV & ME & VR & VS
   ING --> TR & VR
   MS --> MAN
-  REC --> TR
+  REC --> OBS
   SYS[(system.lakeflow.*)] -.read.-> REC
   MAN -.read.-> REC
-  TR & EV & ME & VR & MAN --> VIEWS[rl_v_task_runs · rl_v_job_runs · rl_v_expected_vs_actual · rl_v_validation_latest · rl_v_failure_groups]
+  TR & EV & ME & VR & MAN & OBS --> VIEWS[rl_v_task_runs · rl_v_job_runs · rl_v_expected_vs_actual · rl_v_delivery_completeness · rl_v_validation_latest · rl_v_failure_groups]
   VIEWS --> DASH[Dashboard] & ALERT[SQL Alerts]
   classDef w fill:#eef,stroke:#88a
 ```
@@ -197,24 +203,35 @@ Stdout and console output goes to the driver log only and is never stored in a t
 - **Clustering:** liquid clustering, no Hive partitions.
 - **Compaction:** predictive optimization, or optimizeWrite/autoCompact as a fallback.
 - **Versioning:** every table carries a `runledger.schema_version` tblprop.
-- **Join key:** `run_key` = one task attempt. It is `job:{workspace_id}:{task_run_id}`, `ldp:{pipeline_id}:{update_id}` or `local:{uuid7}`.
+- **Keys.** Job ids are only unique within a workspace, so every key includes the workspace id.
+  - `run_key` is one task attempt. It is `job:{workspace_id}:{task_run_id}`, `ldp:{workspace_id}:{pipeline_id}:{update_id}` or `local:{uuid7}`.
+  - `slot_key` is one *expected* task run: `expected:{workspace_id}:{job_id}:{task_key}:{slot_ts}`.
+  - `rule_key` is the stable business identity of a rule. It is user-provided, or derived from type + dataset + columns. `definition_hash` covers the full definition, including thresholds. Changing a threshold keeps the history (same `rule_key`) but is still visible (new `definition_hash`). *(review B7)*
 - **Denormalized filters:** `job_id`, `job_run_id`, `task_key` and `env` are copied onto every table so alerts rarely need joins.
+- **Three statuses, never merged** *(review A5, A8, A15)*:
+
+  | Status | Values | Answers |
+  |---|---|---|
+  | execution status | SUCCEEDED / FAILED / CANCELLED | Did the code run to completion? |
+  | quality status | PASSED / WARNED / FAILED / NOT_EVALUATED | Did the data pass, under the policy actually enforced? |
+  | telemetry completeness | COMPLETE / PARTIAL / UNKNOWN | Did every record we produced arrive? |
 
 | Table | Grain | Key columns | Cluster by |
 |---|---|---|---|
-| `rl_task_runs` | one row per lifecycle transition (STARTED / FINISHED) | status (RUNNING / SUCCEEDED / WARNED / FAILED / CANCELLED), job/run/task ids, attempt, repair_count, trigger, compute_type, runtime_version, params/tags MAP, `context_sources` MAP, duration, `error STRUCT<class,message,fingerprint,frames>`, `validation_summary STRUCT`, `delivery STRUCT` (health counters) | event_date, job_id |
+| `rl_task_runs` | one row per lifecycle transition (STARTED / FINISHED) | execution_status, quality_status, `had_caught_failures`, workspace/job/run/task ids, attempt, repair_count, trigger, compute_type, runtime_version, params/tags MAP, `context_sources` MAP, duration, `error STRUCT<class,message,fingerprint,frames>`, `validation_summary STRUCT`, `delivery STRUCT` (health counters, plus rows sent and acknowledged per table) | event_date, job_id |
 | `rl_events` | log lines + span start/end | event_id, span_id, parent_span_id, seq, level, kind, name, message, status, duration_ms, error STRUCT, `attributes VARIANT` | event_date, job_id |
 | `rl_metrics` | numeric facts | name, value DOUBLE, unit, dataset, tags | event_date, name |
-| `rl_validation_results` | one row per rule evaluation | suite_name/version, dataset, rule_id (stable hash of type+params), rule_type, columns, severity, outcome (PASS / FAIL / ERROR / SKIPPED), action, total_rows, failed_rows, failed_ratio, observed_value, `threshold`/`observed`/`rule_definition` VARIANT, source (spark / ldp_event_log) | event_date, dataset |
-| `rl_manifest` | one row per expected task per manifest version | manifest_version, bundle_name, target/env, job_name, job_id (filled at sync), task_key, schedule (cron + tz), expected_window (grace), sla_max_duration, criticality, instrumented BOOL, expected_datasets/suites ARRAY, owner, active BOOL | job_id |
-| `rl_validation_samples` | bounded failing-row samples | result_id, rule_id, `row VARIANT`, row_hash. Short retention (14d), separate grants (may hold PII) | event_date, dataset |
+| `rl_validation_results` | one row per rule evaluation | suite_name/version, dataset, `rule_key`, `definition_hash`, rule_type, rule_columns, severity, outcome (PASS / FAIL / ERROR / NOT_EVALUATED / SKIPPED), `effective_policy STRUCT<evaluate,enforce,notify>`, action, total_rows, failed_rows + `failed_rows_basis` (violating_rows / excess_rows / rows_in_duplicate_groups), failed_ratio, observed_value, `unavailable_reason`, `scope VARIANT` (filter, sample fraction, approx flags, source table + Delta version, engine and library version), `threshold`/`observed`/`rule_definition` VARIANT, source (spark / ldp_event_log) | event_date, dataset |
+| `rl_validation_samples` | bounded failing-row samples | result_id, rule_key, `row_data VARIANT`, row_hash. Short retention (14d), separate grants (may hold PII). Never copied into fallback logs | event_date, dataset |
+| `rl_manifest` | one row per expected task per manifest version | manifest_version, workspace_id, `effective_from`, `effective_to`, bundle_name, target/env, job_name, job_id (filled at sync), task_key, `depends_on ARRAY`, `run_if`, `is_failure_handler`, schedule (cron + tz) or trigger kind, grace, sla_max_duration, criticality, instrumented BOOL, expected_datasets/suites ARRAY, owner, active BOOL | job_id |
+| `rl_slot_observations` | one row per expected slot per reconciler conclusion | slot_key, observed_at, manifest_version, matched job_run_id / run_key, platform_state, task_eligibility, telemetry_state, verdict, cause, `cause_confidence` (CONFIRMED / INFERRED / UNKNOWN), `evidence VARIANT`, `supersedes` | event_date, job_id |
 
 **Views:**
-- `rl_v_task_runs`: latest transition per run. STARTED with no FINISHED shows as `UNFINISHED`, or as `CRASHED` when an optional join to `system.lakeflow.job_task_run_timeline` confirms the run ended.
-- `rl_v_job_runs`: the worst task status per job run.
-- `rl_v_validation_latest`
-- `rl_v_failure_groups`: failures grouped by fingerprint.
-- `rl_v_events_dedup`: a safety net against duplicates.
+- `rl_v_task_runs`: current state of each task, using the **effective attempt**, i.e. the latest attempt or repair of that task in its job run. Earlier attempts stay as history. STARTED with no FINISHED shows as `UNFINISHED`. *(review A8)*
+- `rl_v_job_runs`: worst effective-attempt status per job run, so a successful repair turns the job run green.
+- `rl_v_expected_vs_actual`: the latest observation for each expected slot.
+- `rl_v_delivery_completeness`: compares the per-table row counts in each FINISHED row with the rows actually present. *(review A9)*
+- `rl_v_validation_latest` (by `rule_key`), `rl_v_failure_groups` (by fingerprint), and `rl_v_events_dedup` (safety net).
 
 ---
 
@@ -247,26 +264,50 @@ Values are merged field by field, highest precedence first. The source of each f
   - `STARTED` at `init()`
   - any ERROR+ event
   - end of every `Suite.run()`
-  - buffered rows ≥ 1000
-  - more than 60s since the last flush (checked on each emit)
+  - buffered rows ≥ 1000, or buffered bytes ≥ the cap (default 16 MB)
+  - more than 60s since the last flush, **checked only when something is logged**
   - `finish()` / root span exit / `atexit` / excepthook
   - IPython `set_custom_exc`, because notebooks don't fire `sys.excepthook`
 
-  MVP has no background thread.
-- **Delta write**, once per non-empty table: `spark.createDataFrame(rows, staging_schema)` → `parse_json` the VARIANT columns → `.writeTo(fqn).option("txnAppId", f"runledger:{run_key}:{pid}").option("txnVersion", flush_seq).append()`.
+  **Durability, stated honestly** *(review A10)*:
+  - STARTED, ERROR+ events and suite results are durable when they are emitted.
+  - Everything else becomes durable at the next trigger. An event logged just before a 45-minute computation stays buffered until the next log call or exit.
+
+  Whether to add a background flusher for time-based durability is a Phase 0 question.
+- **Bounded blocking** *(review A10)*:
+  - The flush runs on a helper thread, and the job waits at most a time budget (default 30s per flush).
+  - When the budget runs out, the batch goes to fallback and the job carries on.
+  - A commit that lands late is harmless, because a replay reuses the same batch identity (see the next point).
+  - Above the buffer cap, DEBUG then INFO events are dropped first and counted.
+- **Delta write**, once per non-empty table: `spark.createDataFrame(rows, staging_schema)` → `parse_json` the VARIANT columns → `.writeTo(fqn).option("txnAppId", f"runledger:{run_key}:{table}").option("txnVersion", batch_seq).append()`.
   - Arrow-based and Spark Connect-safe.
   - Never creates tables.
   - Blind appends don't conflict with each other.
-  - The txn options make a retried flush exactly-once.
-- **`validate()` on first flush:** compare `spark.table(fqn).schema` with `TableSpec`. If the table is missing or doesn't match, a circuit breaker stops writes to that sink and records fall back to stdlog. Strict mode raises instead.
+  - **Batch identity is fixed once assigned** *(review A9)*. A batch is immutable once numbered. A retry, a late flush or a spill replay reuses the same `(txnAppId, txnVersion)`, so Delta skips a batch that has already committed.
+  - The identity contains no process id. A retried task attempt gets a new `run_key`, so it never collides with the old one.
+- **Per-table acknowledgment and completeness** *(review A9)*:
+  - Each table's write is acknowledged on its own.
+  - Partial success is normal: events can commit while metrics fail. There is no cross-table atomicity, and we don't promise it.
+  - The FINISHED row records rows sent and acknowledged per table, and `rl_v_delivery_completeness` lets readers see any gaps.
+- **Schema compatibility contract** *(review A11)*:
+  - A table is compatible if it has every column the client writes, with compatible types. Extra table columns must be nullable and are ignored.
+  - Each client declares the minimum `runledger.schema_version` it supports.
+  - Migration order: run the additive `ALTER TABLE ... ADD COLUMNS` on the tables first, then upgrade clients.
+  - Concurrent metadata-change conflicts during a migration are retryable, and the compatibility check runs again after them.
 - **Retries:**
-  - Transient errors (gRPC unavailable, 5xx) get 3 attempts with backoff.
-  - Non-retryable errors: table not found, permission denied, schema mismatch.
+  - Transient errors (gRPC unavailable, 5xx, concurrent metadata change) get 3 attempts with backoff, within the time budget.
+  - Non-retryable errors: table not found, permission denied, incompatible schema.
   - When retries run out: count `dropped`, then dump the records as JSON lines to stdlog. v1 adds a spill to a UC Volume.
+- **Fallback output and sensitive data** *(review A12)*:
+  - The stdlog fallback never contains sample rows or attributes flagged as sensitive. It carries identities and counts only.
+  - Spill files (v1) go to a Volume with the same grants and retention as `rl_validation_samples`.
 - **Failures:** logging never raises (except with `strict=True`). The application's own exception always wins.
-- **Crash semantics:** a hard kill loses at most one flush interval of events. `STARTED` and error events are already durable.
+- **Crash semantics:** a hard kill loses whatever is buffered. The reconciler treats missing rows as a telemetry fact, not as proof of a crash (see Never-start detection).
 - **Threads:** `rl.current()` falls back to a process-global ledger. `rl.ThreadPoolExecutor` / `rl.propagate()` copy context so span parentage works in worker threads. Logging is driver-only (never from UDFs).
-- **Rollup:** status order is `SUCCEEDED < WARNED < FAILED`. A span takes the worst of itself and its children. The root span's status becomes the FINISHED status.
+- **Rollup** *(review A8)*:
+  - **Execution status:** only *uncaught* failures propagate to the parent span. A child failure that was caught sets `had_caught_failures=true` on the parent and stays visible in `rl_events`, but the parent can still succeed.
+  - **Quality status** rolls up separately: the worst *enforced* validation outcome.
+  - Job-level views use the effective attempt, so repairs are handled.
 - **Not now:** Zerobus and SQL Statement API sinks. The `Sink` protocol leaves room for them.
 
 ---
@@ -275,7 +316,7 @@ Values are merged field by field, highest precedence first. The source of each f
 
 - **Rule model:** frozen dataclasses with a `type` registry, `severity` (info / warn / error / critical), and tolerance via `mostly` (minimum pass ratio) or `max_failures`.
   - `to_dict` / `from_dict` serialize rules, which is all YAML suites will need later.
-  - `rule_id` = hash of type + canonical params, excluding name and severity, so trends survive renaming or downgrading a rule.
+  - Identity is `rule_key` (stable business identity) plus `definition_hash` (exact definition). See Data model. *(review B7)*
 - **Compilation (`plan.py` → engine-neutral IR):**
 
   | Category | Rules | Spark cost |
@@ -283,50 +324,113 @@ Values are merged field by field, highest precedence first. The source of each f
   | Metadata | `schema(contract, allow_extra, check_nullability)` | No job (`df.schema`) |
   | Row predicates | `not_null`, `accepted_values`, `in_range`, `matches`, `expr`. Each becomes `count_if(NOT coalesce(pred,false))` | Single `agg` |
   | Aggregates | `row_count`, `freshness`, `null_ratio`, `stat_bounds` | Same `agg` |
-  | Uniqueness | `unique(*cols)`: `count(*) - count(DISTINCT struct(cols))`, with `approx=True` available | Same `agg` (≤2 key sets), else +1 |
+  | Uniqueness | `unique(*cols)`; see the uniqueness metrics below | Same `agg` for excess rows; +1 for duplicate groups, only when duplicates exist |
+  | Referential integrity (v1) | `references("customer_id", "main.ref.customers", "id")`: left anti join. Null keys are skipped unless `allow_null=False`; duplicate reference keys don't matter | +1 |
   | Custom SQL | `sql("... {df} ...")` via `spark.sql(q, df=df)` | +1 each |
   | Reconciliation | `reconcile(source, keys, measures, tolerance)`: count + sums + `sum(xxhash64(...))` checksum. A key diff runs only on mismatch | +1 (+1 on failure) |
 
-  No `.cache()`, because serverless doesn't support it. `where=` and `sample_fraction=` limit the cost on very large tables.
-- **Evaluate:** a pure Python function turns metrics + threshold into a `RuleResult`. An exception in one rule gives outcome `ERROR` and does not abort the suite.
-- **Sampling:** one extra pass, only when a row rule fails. Up to N rows per rule go to `rl_validation_samples`, filtered by a column allow-list or redact-list first.
-- **Quarantine:** `good, bad = suite.split(df)` adds an `_rl_failed_rules` column. The user decides where `bad` goes; the library never writes full quarantine data itself.
-- **Severity policy:**
+  - **No caching by default.** Serverless DataFrame caching may now exist in preview (claim C3, to settle). If it's confirmed, it becomes an opt-in, capability-checked setting, never an assumption.
+  - `where=` and `sample_fraction=` limit the cost on very large tables.
+- **Uniqueness metrics** *(review A13)*. For keys `[A, A, B]`:
 
-  | Severity | Action when the rule fails |
+  | Metric | Value | Meaning |
+  |---|---|---|
+  | `duplicate_keys` | 1 | keys that appear more than once |
+  | `excess_rows` | 1 | `count(*) - count(DISTINCT key)` |
+  | `rows_in_duplicate_groups` | 2 | every row whose key is duplicated |
+
+  - Tolerances name the basis they use; the default is `excess_rows`. Results store it in `failed_rows_basis`.
+  - `split()` sends every row in a duplicate group to `bad` by default (`keep="first"` keeps one).
+  - `approx=True` is **observational only**: it can warn, but it can never block, because an approximate count can't prove zero duplicates.
+- **Per-rule error isolation** *(review A1)*:
+  1. **Preflight.** Before anything runs, each rule's expressions are analyzed against the DataFrame's schema. Analysis needs no Spark job. A rule with a missing column or a type error gets outcome `ERROR` immediately, and the others go ahead.
+  2. **Runtime isolation.** If the combined pass fails at runtime (for example, an ANSI cast or overflow error), the rules are re-run in halves, bisecting up to a cap (default 3 extra passes). Rules that are still unresolved get `ERROR`, and the rest get real results.
+  3. **Fail closed.** An `error` or `critical` rule that couldn't be evaluated counts as a failure at its severity. A `warn` or `info` rule that couldn't be evaluated is recorded only. This can be overridden per rule with `on_error="fail" | "record"`.
+- **Evaluate:** a pure Python function turns metrics + threshold into a `RuleResult`.
+- **`suite.explain(df)`** *(review B5)* shows the plan before running anything:
+  - the columns read and the filters applied
+  - exact vs approximate distinct operations
+  - the expected number of Spark passes
+  - when sampling or key-diff passes would trigger
+
+  It gives no runtime or cost estimate.
+- **Scope recorded with every result** *(review B1)*. The population each result judged: the filter, the sample fraction, approx flags, the source table and its Delta version (when the input is a table read), and the engine and library version. Trend charts only compare results with the same scope.
+- **Sampling:** one extra pass, only when a row rule fails. Up to N rows per rule go to `rl_validation_samples`, after a column allow-list or redact-list is applied. Samples never go to fallback logs.
+- **Quarantine:** `good, bad = suite.split(df)` adds an `_rl_failed_rules` column. The user decides where `bad` goes; the library never writes full quarantine data itself.
+- **Write-audit-publish** *(review A14)*. Validating a DataFrame and then writing it can validate data that differs from what gets published: the source can change between the two reads, and the work is computed twice. For gating, the library offers a publish gate:
+  1. **Write:** the data goes to a staging table or to a new version.
+  2. **Audit:** the suite runs against exactly that Delta version.
+  3. **Publish:** the target is updated only if no enforced rule failed.
+
+  The publishing mechanism is open for the review: staging table plus `INSERT OVERWRITE`/`MERGE`, a shallow-clone swap, or write-then-restore. The recommendation is staging table plus publish, because the other two can briefly expose bad data or have more edge cases.
+- **Three independent policy settings** *(review A15)*:
+
+  | Setting | Off means | Env var |
+  |---|---|---|
+  | `evaluate` | checks don't run at all; no Spark cost; `@rl.expect` does nothing | `RUNLEDGER_VALIDATION_EVALUATE` |
+  | `enforce` | failures are recorded but never raise (observe mode) | `RUNLEDGER_VALIDATION_ENFORCE` |
+  | `notify` | results are not eligible for alerts | `RUNLEDGER_VALIDATION_NOTIFY` |
+
+  - The effective policy is stored on every result, and alerts filter on `enforce` and `notify`, so a rule being trialled in observe mode never pages anyone.
+  - `on_failure="return"` never raises. Quality status is still recorded as FAILED; execution status changes only if the caller raises.
+- **Severity policy** (applies when `enforce` is on):
+
+  | Severity | Action when the rule fails, or can't be evaluated |
   |---|---|
   | info | record only |
-  | warn | record + span WARNED |
+  | warn | record; quality status WARNED |
   | error | raise `ValidationFailed` after the whole suite is evaluated and flushed |
   | critical | as error, plus task value `runledger.validation_status=HALTED`, raising `ValidationHalted` |
 
   - Overrides per suite or in Config (e.g. `fail_on="critical"` in dev).
-  - `enforce=False` is observe mode, for rolling out new rules.
-  - `on_failure="return"` hands back the `SuiteResult` without raising.
   - Failing the task is just an exception, so native job notifications, retries and condition tasks all keep working.
-- **LDP:**
-  - `@rlp.expectations(suite)` maps row rules to `expect_all` / `_or_drop` / `_or_fail` by severity. Expectations are named `rl:{rule_id}:{name}`. Both `pyspark.pipelines` and the legacy `dlt` module are supported.
-  - `rlp.aggregate_checks(suite, source=...)` creates a private MV that holds the aggregate rules.
+- **LDP** *(review A2, A3, A4)*:
+  - **Severity and LDP action are separate.** By default `info`/`warn` → `expect` (keep rows, record) and `error`/`critical` → `expect_or_fail`. Dropping rows (`expect_or_drop`) happens only when a rule says `ldp_action="drop"` explicitly, so reusing a suite never silently turns "reject" into "delete".
+  - Rules with `mostly` or `max_failures` can't become row expectations. They are rejected when decorated, with a message pointing to aggregate checks.
+  - Expectations are named `rl:{rule_key}:{name}`. Both `pyspark.pipelines` and the legacy `dlt` module are supported.
+  - `rlp.aggregate_checks(suite, source=...)` is **observational**. It reads the published dataset and can't stop publication. For gating, put a validation task between the pipeline and its downstream consumers, or use write-audit-publish.
   - In LDP mode `init()` only writes to stdlog.
-  - `runledger ingest-pipeline` is a job task that runs after the pipeline. It streams the UC-published event log (`availableNow` + checkpoint) into `rl_validation_results` / `rl_task_runs`.
+  - `runledger ingest-pipeline` runs after the pipeline with `run_if: ALL_DONE`, so failed updates are captured. It also ingests update errors.
+    - Counts that weren't recorded (fail-action expectations may not record metrics; claim C4) are stored as NULL with an `unavailable_reason`, never as 0.
+    - The scheduled catch-up run stays.
+  - To evaluate: the pipeline-events system table (claim C5), as an alternative to publishing each pipeline's event log.
 
 ---
 
 ## Never-start detection: run manifest + reconciler
 
-The library can only record runs that reach `rl.init()`. Several failures happen before that, or with no run at all:
+The library can only record runs that reach `rl.init()`. Several failures happen before that, or with no run at all. The library also keeps going when logging fails, so **a missing row is not proof of anything by itself** *(review A5)*.
 
-| Case | Platform has a run? | runledger STARTED? | Reconciler status |
+**Evidence model.** Each conclusion combines two independent sources:
+- **platform evidence:** the Jobs API or system tables
+- **telemetry evidence:** our rows, delivery health and canary health
+
+A cause is reported only when the evidence supports it, and `cause_confidence` says how strongly.
+
+| Platform says | Our telemetry | Verdict | Confidence |
 |---|---|---|---|
-| Schedule didn't fire, job paused or deleted, trigger broken | no | no | `MISSED_SCHEDULE` |
-| Task skipped because upstream failed or `run_if` excluded it | task record says skipped (**VERIFY** result_state) | no | `SKIPPED_UPSTREAM` |
-| Cluster or serverless env failed, library install failed, import error before init | yes, failed | no | `FAILED_BEFORE_INIT` |
-| Task ran but was never instrumented | yes, succeeded | no | `UNINSTRUMENTED` (info) |
-| Started but no FINISHED, and the platform says it ended | yes | yes | `CRASHED` |
-| Ran longer than the SLA | yes, running | yes | `SLA_BREACH` |
+| no job run matched the slot after grace | — | `MISSED_SCHEDULE` | CONFIRMED if the API scan was complete; otherwise the verdict is `OBSERVATION_INCOMPLETE` |
+| job run exists; task excluded by its `run_if` (e.g. a failure handler on a good run) | — | `EXCLUDED` (info, never alerts) | CONFIRMED |
+| task not run because an upstream task failed | — | `UPSTREAM_FAILED` | CONFIRMED |
+| upstream still running | — | `PENDING` (not late) | — |
+| task failed; no STARTED row; sink and canary healthy | none | `FAILED_BEFORE_INIT` | INFERRED |
+| task failed; no STARTED row; sink health unknown or bad | none | `FAILED` + `TELEMETRY_GAP` | UNKNOWN |
+| task succeeded; no rows; manifest says not instrumented | none | `UNINSTRUMENTED` (info) | CONFIRMED |
+| task succeeded; no rows; manifest says instrumented | none | `TELEMETRY_GAP` | UNKNOWN |
+| task failed or ended; STARTED but no FINISHED | partial | `CRASHED` | INFERRED |
+| task succeeded; STARTED but no FINISHED | partial | `TELEMETRY_GAP` (final flush lost) | CONFIRMED |
+| task still running past its SLA | any | `SLA_BREACH` | CONFIRMED |
+
+**Matching, in order** *(review A6)*:
+1. Expected job slots come from cron + tz. Non-cron triggers (file arrival, continuous, external) use "at least one run per N hours" instead.
+2. Each slot is matched to an actual job run, by trigger time within the grace window.
+3. Per task, eligibility comes from `depends_on` and `run_if` (from the bundle) and the actual task states in that run. A downstream task is late only relative to when its upstream tasks finished, not to when the job started.
+4. Only then is the slot classified.
+
+An API error or a truncated listing produces `OBSERVATION_INCOMPLETE`, never `MISSED_SCHEDULE`.
 
 **Manifest: what should run.**
-- The manifest is **generated from the bundle**, because the bundle already knows every job, task, schedule and target. Nobody hand-writes it.
+- The manifest is **generated from the bundle**, because the bundle already knows every job, task, dependency, `run_if`, schedule and target. Nobody hand-writes it.
 - `runledger manifest build` reads `databricks bundle validate -o json` and writes `runledger.manifest.json`.
 - Optional overrides go in `runledger.yml`:
   - `sla_max_duration`
@@ -335,16 +439,27 @@ The library can only record runs that reach `rl.init()`. Several failures happen
   - `expected_datasets` and suites
   - `owner`
   - `exclude`
-- `runledger manifest sync` runs as a deploy-time task in the setup job. It resolves job_ids through the SDK and appends a new `manifest_version` to `rl_manifest`. The table is append-only and versioned, so the history of what was expected is kept.
+- `runledger manifest sync` runs as a deploy-time task in the setup job.
+  - It resolves job_ids through the SDK and appends a new `manifest_version`.
+  - Each version has `effective_from` / `effective_to`, and each row is workspace-qualified.
+  - Removing a task means a new version without it. Slots are judged against the version that was in effect at slot time *(review A7)*.
 
 **Reconciler: what actually happened.**
 - A serverless job, scheduled every 15 min by default.
-- For each active manifest entry and each expected window, it left-joins:
-  - the expected time slots (computed from cron + tz)
-  - `rl_task_runs`
-  - platform truth: `system.lakeflow.job_run_timeline` / `job_task_run_timeline`, or the Jobs API `list_runs` for low latency. System tables can lag, which is a **VERIFY** item, so the Jobs API is the default and system tables are the backfill.
-- It appends synthetic `rl_task_runs` rows with `transition='RECONCILED'`, `source='reconciler'`, the status from the table above, and a deterministic `run_key`: `expected:{job_id}:{task_key}:{slot_ts}`. Re-running it is a no-op because of txnAppId plus a dedup view.
-- `rl_v_expected_vs_actual` gives one row per expected slot with its outcome. It drives the "expected run missing" SQL alert and the dashboard's coverage tile.
+- It appends **observations** to `rl_slot_observations`. It never writes synthetic `rl_task_runs` rows.
+- **Observations can be superseded** *(review A7)*:
+  - A slot marked `MISSED_SCHEDULE` can later be matched to a delayed run, or to telemetry that was recovered. A new observation then supersedes the old one, and views read the latest.
+  - Identical observations are de-duplicated, but a conclusion is allowed to change.
+- **Explanations** *(review B3)*. Each observation stores its evidence: the manifest version, the matched runs, the age of the evidence and the eligibility reasoning.
+  - `runledger reconcile explain <slot_key>` shows why a verdict was reached.
+  - `runledger reconcile preview` lists upcoming expected slots.
+- **Shadow mode first.** For a newly added job, observations are recorded but don't alert for a trial period (default 7 days), or until the team turns alerts on. Teams see false positives before anyone is paged.
+- **Canary** *(review B2)*:
+  - A tiny scheduled job writes a known record through the library, then confirms it appears in the views.
+  - It also records how fresh the reconciler's last pass is.
+  - A separate alert fires if the canary or the reconciler goes stale.
+  - Canary health is the evidence that upgrades `FAILED_BEFORE_INIT` from UNKNOWN to INFERRED.
+- `rl_v_expected_vs_actual` gives one row per expected slot with its latest verdict. It drives the "expected run missing" alert and the dashboard's coverage tile.
 
 **Why this also helps adoption.** The manifest and reconciler use only bundle metadata and platform data. A team that deploys the template gets run-status coverage of every bundled job **before adding a single line of runledger code**. Each task then moves from `UNINSTRUMENTED` to fully instrumented as the team adopts the library.
 
@@ -427,7 +542,7 @@ df = spark.table("main.raw.orders")                 # notebook cell magic = a sp
 
 **Decorator rules:**
 - They work with or without parentheses.
-- They support sync and async functions.
+- They support sync functions in the MVP; async functions in v1.
 - Generators are rejected with a clear message.
 - `functools.wraps` is used so docs and signatures survive.
 - Nothing runs a Spark job unless you asked for validation; row counts are opt-in.
@@ -446,7 +561,7 @@ df = spark.table("main.raw.orders")                 # notebook cell magic = a sp
 
 - `lakehouse_runledger.auto` runs on import, so it is a separate module. `import lakehouse_runledger` alone has **no** side effects.
 - `cell_spans` can be noisy, so it is opt-in.
-- `@rl.expect` on a lazily evaluated DataFrame triggers a Spark job at return. The docs say so, and it can be turned off globally with `RUNLEDGER_VALIDATION_ENFORCE=false`.
+- `@rl.expect` on a lazily evaluated DataFrame triggers a Spark job at return. The docs say so, `suite.explain(df)` shows the work in advance, and `RUNLEDGER_VALIDATION_EVALUATE=false` turns evaluation off entirely. For gating a write, prefer write-audit-publish over decorating the function that returns the DataFrame.
 - Auto-instrumenting `DataFrameWriter` (monkey-patching writes) is deliberately **not** planned. It is fragile under Spark Connect and surprising. It may become an explicit opt-in later.
 
 ---
@@ -585,21 +700,24 @@ rlp.aggregate_checks(orders_suite, source="orders_silver")
 ## DAB template (`bundle_template/`)
 
 - **`databricks.yml`:** dev/prod targets and the `runledger_ctx` variable.
-- **`lakehouse_runledger.schema.yml`:** the schema plus Volumes for spill and checkpoints.
+- **`runledger.schema.yml`:** the schema plus Volumes for spill and checkpoints.
 - **`runledger_setup.job.yml`:** serverless SQL tasks that run `01_tables.sql`, `02_views.sql` and `03_grants.sql`. These files are generated by `runledger ddl` from `schema/tables.py`, and CI checks they haven't drifted.
-- **`runledger_maintenance.job.yml`:** daily retention deletes, `ingest-pipeline`, and spill recovery.
-- **`runledger_reconciler.job.yml`:** every 15 min on serverless, running `runledger reconcile`. The setup job also runs `runledger manifest sync` on each deploy.
+- **`runledger_maintenance.job.yml`:** daily retention deletes, catch-up `ingest-pipeline`, and spill recovery.
+- **`runledger_canary.job.yml`:** writes a known record through the library and checks it reaches the views; also checks how fresh the reconciler is.
+- **`runledger_reconciler.job.yml`:** every 15 min on serverless, running `runledger reconcile`. New jobs start in shadow mode. The setup job also runs `runledger manifest sync` on each deploy.
 - **`runledger.yml`:** optional manifest overrides (SLA, grace, criticality, expected datasets, owner, exclude).
 - **Bundle Python mutator (opt-in):** injects `runledger_ctx` and the library dependency into every task, so teams wire nothing by hand.
 - **`runledger.dashboard.yml`:** an AI/BI dashboard with four pages: Overview (status, success rate, p50/p95, unfinished/crashed), Failures (top fingerprints with run links), Data quality (pass rate, observed-value trends, samples), and Delivery health.
-- **`runledger.alerts.yml`:** five SQL Alerts to notification destinations, covering:
-  - a critical or error validation FAIL
+- **`runledger.alerts.yml`:** SQL Alerts to notification destinations. Validation alerts only consider results with `enforce` and `notify` on, and reconciler alerts skip slots in shadow mode. They cover:
+  - a critical or error validation FAIL (including rules that couldn't be evaluated)
   - a task FAILED or CRASHED in prod
   - a dataset not validated in 24h
   - delivery dropped > 0
   - a run UNFINISHED for more than X hours
-  - an expected run that is missing or failed before init (from `rl_v_expected_vs_actual`)
-- **Examples:** `example_job.job.yml` (notebook + wheel + pipeline + ingest) and `example_pipeline.pipeline.yml` (event log published to UC, `runledger.mode=ldp`).
+  - an expected run that is missing or failed before init (from `rl_v_expected_vs_actual`, only CONFIRMED or INFERRED verdicts)
+  - the canary or reconciler is stale
+  - incomplete delivery (`rl_v_delivery_completeness`)
+- **Examples:** `example_job.job.yml` (notebook + wheel + pipeline + an ingest task with `run_if: ALL_DONE`) and `example_pipeline.pipeline.yml` (event log published to UC, `runledger.mode=ldp`).
 
 ---
 
@@ -618,6 +736,12 @@ rlp.aggregate_checks(orders_suite, source="orders_silver")
 - system-table latency and the task `result_state` values for skipped or upstream-failed tasks
 - the `bundle validate -o json` shape
 - support for DAB Python mutators
+- rule-error isolation: preflight analysis with no Spark job, and how runtime errors surface under ANSI mode
+- flush time budget: can a flush be abandoned safely while a Spark Connect operation is in flight? Is a background flusher needed?
+- partial multi-table delivery, and a replay after a lost acknowledgment
+- how repairs appear in the Jobs API and system tables (task run ids, attempt numbers)
+- write-audit-publish mechanism: staging + publish vs shallow-clone swap
+- the platform claims in [review-brief.md §12](review-brief.md#12-platform-claims-to-settle-in-the-design-review) that the design review couldn't settle
 
 The findings go into `docs/platform-notes.md`, and each one has a fallback ready (STRING instead of VARIANT, a dedup view instead of txn idempotency, a setup task using the SDK for alerts).
 
@@ -625,14 +749,26 @@ The findings go into `docs/platform-notes.md`, and each one has a fallback ready
 - core: ledger, spans, events, metrics, ambient logger, redaction, fingerprint, health
 - context: explicit + params + env + basic detection
 - sinks: console, stdlog, memory, delta (buffered, retried, idempotent, validated, with circuit breaker)
-- the four main tables and their views; STARTED/FINISHED for notebook and wheel tasks
-- validation: schema, not_null, unique, row_count, accepted_values, in_range, expr, compiled to a single pass, with the severity policy and observe mode
+- tables: task runs, events, metrics, validation results, manifest and slot observations, with their views; STARTED/FINISHED for notebook and wheel tasks
+- validation: schema, not_null, unique, row_count, accepted_values, in_range, expr
+  - compiled to a single pass, with per-rule error isolation
+  - the severity policy and the evaluate/enforce/notify settings
+  - `rule_key` + `definition_hash`, recorded scope, and `suite.explain`
 - CLI `ddl` and `doctor`; a minimal DAB (schema, setup job, example job)
-- the easy layer: `import lakehouse_runledger.auto`, `@rl.task`, `@rl.step`, `@rl.expect` / `@rl.expect_input`, and the logging bridge
-- manifest v0: `manifest build` + `sync` from the bundle, plus a reconciler that uses the Jobs API to detect MISSED_SCHEDULE, FAILED_BEFORE_INIT and UNINSTRUMENTED, and `rl_v_expected_vs_actual`. Never-start detection is in the MVP because it is the zero-code entry point.
+- the easy layer: `import lakehouse_runledger.auto`, `@rl.task`, `@rl.step` (sync only), `@rl.expect` / `@rl.expect_input`, and the logging bridge
+- manifest v0: `manifest build` + `sync` from the bundle
+- a reconciler that uses the Jobs API with the evidence model:
+  - verdicts: MISSED_SCHEDULE, EXCLUDED, UPSTREAM_FAILED, FAILED_BEFORE_INIT, UNINSTRUMENTED, TELEMETRY_GAP, OBSERVATION_INCOMPLETE
+  - shadow mode and `reconcile explain`
+  - `rl_v_expected_vs_actual`
+  
+  Never-start detection is in the MVP because it is the zero-code entry point.
+- **something visible for pilots** *(review A17)*: the coverage view, one alert (expected run missing / failed before init), the canary, and a small recurring integration smoke test on serverless and classic
 
 **Phase 2: v1.0**
-- validation: freshness, matches, stat_bounds, sql, reconcile
+- validation: freshness, matches, stat_bounds, sql, reconcile, references (referential integrity)
+- the write-audit-publish gate (an MVP candidate if a pilot needs gating; decide in the review)
+- async support in decorators
 - the samples table and `split()`
 - rollups including `validation_summary`
 - LDP: expectations, aggregate checks, event-log ingestion
@@ -644,7 +780,7 @@ The findings go into `docs/platform-notes.md`, and each one has a fallback ready
 - full DAB: dashboard, alerts, maintenance
 - the Tier 4 CI matrix
 - a published `Notifier` protocol
-- reconciler: SKIPPED_UPSTREAM, SLA_BREACH and a system-table backfill; `cell_spans` and the `%%rl_step` magic; the bundle mutator; `manifest add` for non-bundle jobs
+- reconciler: SLA_BREACH, CRASHED and a system-table backfill; evaluate the pipeline-events system table; `cell_spans` and the `%%rl_step` magic; the bundle mutator; `manifest add` for non-bundle jobs
 
 **Later**
 - YAML and table-driven suites, plus a `run-suite` task
@@ -668,6 +804,10 @@ The findings go into `docs/platform-notes.md`, and each one has a fallback ready
 - **Permissions.** Each job's run-as principal needs MODIFY on the `rl_*` tables. Setup runs as a privileged principal.
 - **Reconciler accuracy.** Cron slots vs actual trigger times, file-arrival and continuous triggers that have no fixed schedule (these use "at least one run per N hours" SLAs instead), timezone/DST edges, and paused jobs. The reconciler principal needs read access to Jobs and system tables.
 - **Decorator magic vs explicitness.** Keep the decorators thin wrappers over the explicit API, so behaviour is identical and debuggable.
+- **Cost of rule-error isolation.** Bisecting after a runtime failure adds passes. It is capped, and preflight catches most errors without a job.
+- **Trust in reconciler verdicts.** A false "failed" or "missed" destroys trust quickly. Mitigated by the evidence model, the confidence levels, shadow mode, explanations and the canary.
+- **Shared tables are not write-only.** UC `MODIFY` lets one team's jobs change other teams' rows (claim C7). The options are per-team schemas with union views, or accepting it. Open question Q-G6.
+- **Validated vs published data.** Without write-audit-publish, a gate can pass data that differs from what is written. The docs steer gating to the publish gate.
 
 ---
 
@@ -680,10 +820,13 @@ The findings go into `docs/platform-notes.md`, and each one has a fallback ready
   - flush triggers (fake clock + MemorySink)
   - retry classification and circuit breaker
   - lifecycle hooks
-  - rollup
-  - Hypothesis round-trips for Rule/Suite and `rule_id`
+  - rollup: a caught child failure leaves the parent SUCCEEDED; quality status rolls up separately
+  - Hypothesis round-trips for Rule/Suite, `rule_key` stability and `definition_hash` changes
   - golden compiler IR
-  - pure evaluate and policy
+  - pure evaluate and policy, including fail-closed for rules that couldn't be evaluated and the evaluate/enforce/notify combinations
+  - uniqueness metrics on `[A, A, B]` (excess 1, groups 2, keys 1)
+  - LDP mapping: `error` never becomes drop without `ldp_action="drop"`; `mostly` is rejected
+  - reconciler classification from recorded evidence fixtures: late downstream task, failure handler excluded, partial API scan, late evidence superseding, repaired run
   - DDL drift
 - **Tier 2: local pyspark 3.5 and 4.x with delta-spark.** Covers:
   - real aggregation semantics: NULLs, uniqueness, freshness across timezones, reconcile
@@ -692,6 +835,10 @@ The findings go into `docs/platform-notes.md`, and each one has a fallback ready
   - txnAppId duplicate suppression
   - VARIANT staging
   - the sampling pass
+  - rule-error isolation: one rule that raises at runtime; the others still produce results
+  - partial multi-table delivery and a replay after a lost acknowledgment (no duplicates, completeness view correct)
+  - mixed client versions after an additive migration
+  - write-audit-publish: a failed audit leaves the target unchanged
 - **Tier 3: Spark Connect** (`pyspark --remote local`). Re-runs the Tier 2 write and validation tests through a Connect session.
 - **Tier 4: Databricks, via the bundle `-t it` target.**
   - Matrix: serverless notebook + wheel, classic DBR 15.4 LTS and the latest LTS, and a serverless LDP pipeline + ingest.
@@ -706,13 +853,15 @@ The findings go into `docs/platform-notes.md`, and each one has a fallback ready
     - a task excluded by `run_if`
     - a paused scheduled job
 
-    Assert the reconciler emits FAILED_BEFORE_INIT, SKIPPED_UPSTREAM and MISSED_SCHEDULE within one reconcile interval, and stays idempotent on re-run.
+    Also: a failure → repair → success sequence (the job run ends green), and a sink outage during a successful task (TELEMETRY_GAP, not FAILED).
+
+    Assert the reconciler emits the expected verdicts within one reconcile interval, and that re-running it doesn't change conclusions unless new evidence arrives.
   - Ease-of-use check: a fresh notebook containing only `import lakehouse_runledger.auto`, plus a decorated wheel, produce complete rows with no other configuration.
 - **Performance gate:** 10k events plus a 10-rule suite on 10M rows. Validation uses one Spark job when every rule passes, and commits stay within budget.
 
 ## First implementation steps (after the design review and Phase 0 spike)
 
-1. Create `C:\Users\aarba\pydev\runledger`: git init, `pyproject.toml`, src layout, ruff/pytest config, and this plan as `docs/design.md`.
+1. Add packaging to this repo: `pyproject.toml`, src layout, ruff/pytest config.
 2. Write `schema/tables.py` and `ddl.py` first, since everything else derives from them.
 3. Build `config.py` and `context/` with their unit tests.
 4. Build `core/` (records, span, ledger, buffer, lifecycle) with MemorySink tests.

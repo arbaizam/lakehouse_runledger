@@ -2,6 +2,7 @@
 
 **Purpose:** prepare a working session to refine the plan with a senior data engineer.
 **Status:** planning only. Nothing is built, and no decision below is final until this review.
+**Revision:** updated after review round 1, an external architecture review of the plan. What changed is in §11. Platform claims to settle in this review are in §12.
 **Read time:** about 20 minutes for this brief. [design.md](design.md) has the details; [features.md](features.md) gives an example for every feature.
 
 ---
@@ -50,10 +51,14 @@ Adoption is the main design constraint. A team gets value with zero lines of cod
 | D5 | Never-start detection through a bundle-generated manifest and a reconciler | Decided | Covers failures the library can never see | Jobs are mostly triggered from outside Databricks; see Q-N1 |
 | D6 | One table per grain (runs, events, metrics, validation results, samples, manifest) instead of one wide table | Proposed | Typed evidence, simpler alert SQL, different retention and grants per table | The team prefers one table for simplicity |
 | D7 | Append-only writes; current state comes from views; no MERGE on the hot path | Proposed | Hundreds of concurrent tasks never conflict; a crash can't leave a half-updated row | — |
-| D8 | Writes go through Spark `createDataFrame` + `writeTo().append()`, buffered, with `txnAppId` for idempotency | Proposed | Inside the task's own compute with its own identity; Spark Connect-safe | Spike shows commit latency is too high; see R3 |
+| D8 | Writes go through Spark `createDataFrame` + `writeTo().append()`, buffered, with a stable per-table batch identity (`txnAppId`/`txnVersion`), per-table acknowledgments and a time budget on every flush | Proposed (revised, A9/A10) | Inside the task's own compute with its own identity; Spark Connect-safe; logging can't stall the job | Spike shows commit latency is too high, or a flush can't be abandoned safely |
 | D9 | Context comes mainly from job parameters (`{{job.run_id}}` …); auto-detection is a fallback | Proposed | Dynamic references behave the same on all compute | Spike shows auto-detection is reliable on serverless |
-| D10 | Our own rule compiler (one `agg()` pass) instead of wrapping an existing data-quality library | **Open** | Control over cost, typed results and severity policy | DQX covers our needs; see section 4 |
+| D10 | Validation engine: (a) our own compiler, (b) wrap DQX, or (c) our rule API and result format with a swappable engine (DQX could be one engine) | **Open** (widened, A16) | Control over cost, typed results, error semantics and severity policy | The DQX comparison (§7) shows it meets the result format, error semantics and gating needs |
 | D11 | Minimum Databricks Runtime 15.4 LTS, because `VARIANT` columns need it | **Open** | Free-form fields without JSON strings | Older runtimes are in use; see Q-E3 |
+| D13 | Three separate statuses: execution, data quality, and telemetry completeness | Proposed (new, A5/A8/A15) | Repairs, caught failures, observe mode and sink outages each made a single status misleading | — |
+| D14 | The reconciler uses an evidence model: every verdict carries a confidence; missing telemetry is reported as `TELEMETRY_GAP`; observations can be superseded; shadow mode and a canary | Proposed (new, A5–A7) | False "failed" or "missed" verdicts would destroy trust | Too complex for the MVP; could ship with fewer verdicts |
+| D15 | In LDP, severity and action are separate: `error` → fail the update; dropping rows needs an explicit opt-in; aggregate checks are observational | Proposed (new, A2/A3) | Reusing a suite must never quietly turn "reject" into "delete" | — |
+| D16 | Gating uses write-audit-publish: validate the exact Delta version that will be published | Proposed (new, A14) | Validating a DataFrame and then writing it can validate data that differs from what gets published | Teams find a staging step too heavy; it could stay opt-in |
 | D12 | Naming: install `lakehouse-runledger`, import `lakehouse_runledger`; the CLI, `rl_` tables and `RUNLEDGER_*` env vars use the short name | Proposed | Short names where people type or query them | — |
 
 ---
@@ -86,8 +91,9 @@ My recommendation is a one-day time-boxed comparison during the Phase 0 spike, b
 2. **Small files at high concurrency.** Many tasks appending small batches relies on predictive optimization or auto-compaction. Is predictive optimization enabled for us?
 3. **Notebook end-of-run hooks.** Detecting a notebook's end reliably (IPython exception hooks, `dbutils.notebook.exit`) is the most fragile part of the one-liner. If it's unreliable, notebooks need an explicit `rl.finish()`, which raises the barrier.
 4. **Reconciler accuracy.** Expected slots from cron are straightforward. File-arrival, continuous and externally triggered jobs are not, and false "missed" alerts would hurt trust quickly.
-5. **Decorators that trigger Spark jobs.** `@rl.expect` runs validation when the function returns. That's convenient, but hidden compute cost can surprise people. Is it the right default, or should validation always be an explicit call?
-6. **The scope of the MVP.** It includes the core, the Delta sink, seven rules, the decorators and manifest v0. Is that the right slice, or should the MVP drop the manifest, or drop validation?
+5. **Decorators that trigger Spark jobs.** `@rl.expect` runs validation when the function returns. `suite.explain()` now shows that work in advance, and gating is steered toward write-audit-publish. Is the decorator still the right *default* for validation, or should it be reserved for observing?
+6. **The scope of the MVP.** After review round 1 it gained something visible for pilots (coverage view, one alert, canary, smoke tests), error isolation and a fuller reconciler. Async decorators moved to v1. Is it now too big? The first candidates to cut would be the reconciler's less common verdicts or the logging bridge.
+7. **Rule-error isolation cost.** Bisecting after a runtime error is capped at 3 extra passes. Is that acceptable on the largest tables (Q-S3), or should a runtime error just mark the whole suite `ERROR`?
 
 ---
 
@@ -141,6 +147,7 @@ Each question says what changes in the plan depending on the answer.
 | Q-G3 | Who should be able to read the `rl_*` tables: all engineers, owners only, auditors? | Grants model; per-team row filters |
 | Q-G4 | Which identity do jobs run as (service principals per team, or shared)? | MODIFY grants on `rl_*`; reconciler permissions |
 | Q-G5 | Is outbound network access from jobs allowed (for future webhooks)? | Whether in-task webhooks are viable or alerts must stay in Databricks |
+| Q-G6 | With shared `rl_*` tables, every producing job needs `MODIFY`, so it can change other teams' rows (claim C7). Is that acceptable, or do we need per-team schemas with union views? | Grants model and the bundle template layout |
 
 ### Alerting and operations
 
@@ -176,7 +183,13 @@ Time box: about one week. Each item has a fallback, so none of them blocks the d
 | Notebook end hooks (IPython exception hook, `dbutils.notebook.exit` classification) | Notebook scenarios: success, raise, exit | Require `rl.finish()` in notebooks |
 | System-table lag and `result_state` values for skipped or upstream-failed tasks | Compare with the Jobs API over a day | Jobs API only |
 | `databricks bundle validate -o json` shape; DAB Python mutators; DAB `alerts` resource | CLI version check plus a sample bundle | Manifest from YAML; alerts created by an SDK task |
-| **DQX comparison (D10)** | Implement the five MVP rules in DQX on one real table; compare cost, result shape and ergonomics | Decide build vs. wrap |
+| Rule-error isolation (A1) | A suite with one rule that fails analysis and one that raises at runtime (e.g. a bad cast); check that the others still produce results | Treat a runtime error as `ERROR` for the whole suite |
+| Flush time budget (A10) | Abandon a flush mid-write under Spark Connect; check that a late commit plus replay leaves no duplicates | Synchronous flush with a documented worst case |
+| Partial delivery and lost acknowledgment (A9) | Fail one of two table writes; drop an acknowledgment and replay | Dedup views and the completeness view only |
+| Repairs (A8) | Run fail → repair → success; inspect run ids and attempt numbers in the Jobs API and system tables | Effective attempt by latest start time |
+| Write-audit-publish mechanism (A14) | Compare staging + `INSERT OVERWRITE` vs a shallow-clone swap on one table | Staging + publish |
+| Claims C1–C12 (§12) | Settle in the review where possible; test the rest here | See §12 |
+| **DQX comparison (D10)** | Build each option against our needs: result format, error semantics, blocking before the write, supported compute (serverless, classic, LDP) and total cost, on a real table. Not just "five rules" (A16) | Decide (a), (b) or (c) |
 
 ---
 
@@ -187,7 +200,7 @@ These are order-of-magnitude numbers for one experienced engineer, assuming the 
 | Phase | Scope | Rough effort |
 |---|---|---|
 | Phase 0 | Spike plus the DQX comparison | ~1 week |
-| MVP (0.1) | Core, Delta sink, seven rules, decorators, logging bridge, manifest v0, minimal bundle | ~5–7 weeks (≈3 fewer if DQX is wrapped) |
+| MVP (0.1) | Core, Delta sink, seven rules with error isolation, decorators, logging bridge, manifest v0 + reconciler with evidence model, canary, one alert, minimal bundle | ~7–9 weeks (≈2–3 fewer if DQX is wrapped); grew after review round 1 |
 | v1.0 | Remaining rules, samples, LDP, crash inference, dashboard, alerts, maintenance, Tier 4 CI | ~6–8 weeks |
 | Pilot | Two or three pipelines in production, feedback, docs | ~2 weeks, overlapping v1 |
 
@@ -199,7 +212,7 @@ These are order-of-magnitude numbers for one experienced engineer, assuming the 
 2. **15 min:** build vs. adopt, ending in a direction for D10 (section 4).
 3. **20 min:** walk the environment and scale questions (section 6: S, E). Capture answers live.
 4. **15 min:** data quality and governance questions (section 6: V, G).
-5. **15 min:** challenge the uncertain areas (section 5) and the proposed decisions D6–D9.
+5. **15 min:** challenge the uncertain areas (section 5), the proposed decisions D6–D9 and D13–D16, and settle what you can in §12.
 6. **10 min:** confirm the MVP scope and the pilot pipelines (Q-A3).
 7. **5 min:** assign owners for the Phase 0 spike items.
 
@@ -207,9 +220,74 @@ These are order-of-magnitude numbers for one experienced engineer, assuming the 
 
 - [ ] Answers, or owners, for every section-6 question
 - [ ] D10 direction (build, wrap DQX, or decide after the spike)
-- [ ] D6–D9 accepted or changed
+- [ ] D6–D9 and D13–D16 accepted or changed
+- [ ] §12 claims: each settled, or assigned to the spike
 - [ ] D11 runtime floor confirmed
 - [ ] MVP scope confirmed or trimmed
 - [ ] Pilot pipelines named
 - [ ] Spike owners and dates
 - [ ] Changes to make in design.md and features.md
+
+---
+
+## 11. Review round 1: what changed
+
+An external architecture review (Codex) raised 17 challenges (A1–A17) and 7 ideas (B1–B7). This table records what each one changed in the plan, so that today's discussion can confirm or overturn the changes.
+
+| Ref | Finding (short) | Disposition | What changed | Where |
+|---|---|---|---|---|
+| A1 | One combined aggregation can't isolate a failing rule | Accepted | Preflight analysis (no Spark job); bisect re-run on runtime errors (capped); rules that can't be evaluated fail closed | design › Validation engine; features E16 |
+| A2 | In LDP, reusing a suite turned `error` into dropping rows | Accepted | Severity separate from LDP action; `error` → fail; dropping needs opt-in; `mostly` rejected for expectations | design › Validation engine › LDP; features F1, E4 |
+| A3 | Aggregate checks in LDP don't gate publication | Accepted | Labelled observational; gating goes through a validation task or write-audit-publish | features F2 |
+| A4 | Ingestion skipped failed pipeline runs; unrecorded counts | Accepted | Ingest task runs with `run_if: ALL_DONE`; update errors ingested; NULL + reason instead of 0 | features F3; DAB template |
+| A5 | Missing telemetry ≠ crash or failed-before-init | Accepted | Evidence model with confidence levels; `TELEMETRY_GAP`; canary as evidence | design › Never-start; features G2, G5 |
+| A6 | Not every task starts in the job's window; failure handlers are excluded on good runs | Accepted | Match slot → job run → task eligibility; `EXCLUDED`, `UPSTREAM_FAILED`, `PENDING`, `OBSERVATION_INCOMPLETE` | design › Never-start |
+| A7 | Late evidence; identities lacked the workspace | Accepted | Workspace-qualified keys; manifests with effective dates; observations can be superseded in a new `rl_slot_observations` table | design › Data model, Never-start |
+| A8 | "Worst status ever" mishandles repairs and caught exceptions | Accepted | Effective attempt; only uncaught failures propagate; separate quality status | design › Data model, Write path; features B5 |
+| A9 | Txn dedup ≠ complete delivery; process id broke replay | Accepted | Stable batch identity per table (no process id); per-table acknowledgments; `rl_v_delivery_completeness` | design › Write path; features D2 |
+| A10 | Logging could block; the 60s interval only fires when something is logged | Accepted | Time budget per flush; buffer byte cap; durability stated honestly; background flusher is a spike question | design › Write path; features D1 |
+| A11 | Additive migrations could disable older clients | Accepted | Compatibility = "has at least my columns"; migration order; metadata conflicts retryable | design › Write path; features D3 |
+| A12 | Sample rows could leak through fallback logs and spill; MODIFY isn't write-only | Accepted | Samples never in fallback; spill has the same controls; Q-G6 added | design › Write path; risks |
+| A13 | "Failed rows" is ambiguous for uniqueness; approx can't prove zero | Accepted | Three uniqueness metrics with a stated basis; approx is observational only | design › Validation engine; features E2, E10, E12 |
+| A14 | Validated data may not equal published data | Accepted, extended | Write-audit-publish gate (v1, MVP candidate) | design › Validation engine; features E13 |
+| A15 | Observe mode, evaluation and alerting were conflated | Accepted | Separate `evaluate` / `enforce` / `notify` settings; effective policy stored per result; alerts filter on it | features E5, H6 |
+| A16 | The DQX comparison was too narrow | Accepted | D10 widened to three options with full criteria | §3 D10, §7 |
+| A17 | The MVP postponed visible value | Partially accepted | MVP adds coverage view, one alert, canary and smoke tests; async decorators moved to v1; the logging bridge stays in the MVP (cheap, high value) | design › Roadmap |
+| B1 | Record the scope of each validation | Adopted (MVP) | `scope` on every result | features E15 |
+| B2 | Independent canary | Adopted (MVP) | Canary job and staleness alert | features G5 |
+| B3 | Explain verdicts; preview slots | Adopted (MVP) | `reconcile explain` / `preview`; shadow mode | features G4 |
+| B4 | Pipeline-events system table | To evaluate (v1) | Depends on claim C5 | design › Validation engine › LDP |
+| B5 | Explain the validation plan before running | Adopted (MVP) | `suite.explain(df)` | features E14 |
+| B6 | Referential-integrity rule | Adopted (v1) | `c.references(...)` | features E2 |
+| B7 | Stable business rule identity | Adopted (MVP) | `rule_key` + `definition_hash` | design › Data model |
+
+## 12. Platform claims to settle in the design review
+
+The reviewer cited Databricks or DQX documentation for these claims, but none of them has been checked against our workspace. Each one changes part of the design. Please settle what you can in the review; anything left goes to the Phase 0 spike.
+
+**Columns:**
+- **Plan confidence:** how sure the plan's author is, before any check.
+- **If false:** what changes in the design.
+- **How to check:** a quick test or the documentation to read.
+
+| # | Claim | Source cited by reviewer | Plan confidence | If false | How to check |
+|---|---|---|---|---|---|
+| C1 | Serverless runs with ANSI SQL mode on by default, so invalid casts and overflows raise errors instead of returning NULL | [Serverless limitations](https://docs.databricks.com/aws/en/compute/serverless/limitations) | Medium | Runtime errors are rarer; the bisect path is still needed on classic with ANSI on | `SELECT CAST('x' AS INT)` on serverless vs classic; read `spark.sql.ansi.enabled` |
+| C2 | Serverless job queries have no execution timeout by default | Same page | Medium | Less risk of an unbounded flush; the time budget stays | Documentation; check the default `STATEMENT_TIMEOUT` behaviour for jobs |
+| C3 | DataFrame caching is available on serverless as a preview, requiring environment version 5+ | [Serverless DataFrame cache](https://docs.databricks.com/aws/en/compute/serverless/dataframe-cache) | Low (the plan assumed no cache) | Keep "no cache"; if true, offer opt-in caching and revisit the env v2+ floor | `df.cache()` on serverless env v4 vs v5 |
+| C4 | `expect_or_fail` expectations don't record the normal expectation metrics in the event log | [Expectations](https://docs.databricks.com/aws/en/ldp/expectations#expectation-tracking-metrics) | Medium | Ingestion can report counts for failed updates | Run a pipeline with a failing `expect_or_fail`; inspect `flow_progress` |
+| C5 | A regional pipeline-events system table exists (Beta), with an example dashboard | [Monitor and query events](https://docs.databricks.com/aws/en/ldp/monitor-and-query-events) | Low (new to the plan) | Keep per-pipeline event-log publishing | Check whether the table is available in our region and metastore; compare its latency with the event log |
+| C6 | DQX provides per-check summary metrics, fingerprints, stored results, and a Beta `FailPipeline` action | [DQX summary metrics](https://databrickslabs.github.io/dqx/docs/guide/summary_metrics/), [actions](https://databrickslabs.github.io/dqx/docs/guide/actions_and_alerts/) | Low (not yet evaluated) | Strengthens option (a) for D10 | Part of the D10 comparison |
+| C7 | UC `MODIFY` on a table permits updating and deleting rows (and works with SELECT), so a shared table isn't write-only between teams | [UC privileges](https://docs.databricks.com/aws/en/data-governance/unity-catalog/access-control/privileges-reference) | High | Shared tables are fine as planned | Documentation; Q-G6 decides what we do about it |
+| C8 | Repairs re-run tasks inside the original job run (same job run id, new task run ids) | [Repair API](https://docs.databricks.com/api/jobs/v2/repair) | High | Effective-attempt logic keys on something else | Spike: fail → repair → success, then inspect the ids |
+| C9 | "Excluded by `run_if`" and "upstream failed" are distinct task states in the Jobs API and system tables | [run_if dependencies](https://docs.databricks.com/aws/en/jobs/run-if) | Medium | The reconciler can't separate `EXCLUDED` from `UPSTREAM_FAILED`; it reports both as not run | Spike: a job with a failure-handler task; inspect `result_state` / `termination_details` |
+| C10 | The default `run_if` is ALL_SUCCESS, so a task after a failed pipeline is skipped unless it uses `ALL_DONE` | Same page | High | No change needed (but ALL_DONE is harmless) | Documentation |
+| C11 | Concurrent metadata changes (e.g. `ALTER TABLE ADD COLUMNS`) can fail concurrent blind appends | [Isolation levels and write conflicts](https://docs.databricks.com/aws/en/optimizations/isolation) | High | The retry rule for metadata conflicts isn't needed | Documentation; spike during the migration test |
+| C12 | Delta skips a batch whose `(txnAppId, txnVersion)` it has already committed; keeping that identity stable is the writer's job | [Idempotent table writes](https://docs.databricks.com/aws/en/structured-streaming/delta-lake#use-foreachbatch-for-idempotent-table-writes) | High for `foreachBatch`; **unverified for batch `writeTo` under Spark Connect** | Fall back to dedup views | Already a Phase 0 item: write the same batch twice and count the rows |
+
+Plan claims from before the review that still need the same treatment, and are already on the Phase 0 list:
+- `VARIANT` needs DBR 15.3+, which sets the 15.4 LTS floor
+- the names of the dynamic value references
+- whether a job-level parameter can use `{{task.*}}`
+- the IPython exception hook in notebooks, and how `dbutils.notebook.exit` is classified
+- whether the DAB `alerts` resource and Python mutators are supported

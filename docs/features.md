@@ -8,6 +8,9 @@ Each feature comes with a short example. The **Phase** column follows the roadma
 | **v1** | 1.0 |
 | **Later** | planned after 1.0 |
 
+Revised after review round 1. Changed or new features carry *(review …)* tags that point to
+[review-brief.md §11](review-brief.md#11-review-round-1-what-changed).
+
 Examples assume `import lakehouse_runledger as rl` and `from lakehouse_runledger import checks as c`.
 
 ## Contents
@@ -67,7 +70,7 @@ def main(): ...
 
 ### A4. `@rl.step`: a timed span per function (MVP)
 
-Each call records a span with name, duration, status and exception. Sync and async functions are both supported.
+Each call records a span with name, duration, status and exception. Sync functions in the MVP; async functions in v1.
 
 ```python
 @rl.step
@@ -175,14 +178,26 @@ with rl.span("load") as s:
     s.metric("files_read", 12)
 ```
 
-### B5. Status rollup (MVP)
+### B5. Status rollup (MVP) *(review A8)*
 
-A span's status is the worst of itself and its children (`SUCCEEDED < WARNED < FAILED`). A warn-level rule failure makes the whole task WARNED.
+Three statuses are tracked separately: execution, quality and telemetry completeness.
+- Only *uncaught* failures make a parent span FAILED.
+- A caught child failure is still recorded, and sets `had_caught_failures` on the parent.
+- Data-quality outcomes roll up into the quality status, not the execution status.
 
 ```python
-with rl.span("publish"):  # becomes WARNED
+with rl.span("load"):                       # execution SUCCEEDED, had_caught_failures = true
+    try:
+        with rl.span("load.primary"):       # FAILED (recorded in rl_events)
+            read_primary()
+    except SourceDown:
+        read_replica()
+
+with rl.span("publish"):                    # execution SUCCEEDED, quality WARNED
     rl.validate(df).accepted_values("status", ["NEW"], severity="warn").run()
 ```
+
+Job-level views use each task's **effective attempt**, so a failed task that is repaired successfully turns the job run green, while the failed attempt stays in history.
 
 ### B6. Exception capture and fingerprints (MVP)
 
@@ -287,30 +302,42 @@ rl.init(enrich_from_api=True)  # one Jobs API call: job_name, run_as, trigger
 
 ## D. Delivery and sinks
 
-### D1. Buffered, batched flushing (MVP)
+### D1. Buffered, batched, bounded flushing (MVP) *(review A10)*
 
 Each flush makes about one commit per table. A flush happens on any of:
-- 1000 rows buffered
-- 60 seconds since the last flush
+- 1000 rows or 16 MB buffered
+- 60 seconds since the last flush (checked when something is logged)
 - an ERROR event
 - the end of a suite
 - `finish()` or process exit
 
+A flush never blocks the job for longer than its time budget.
+
 ```python
-rl.init(config=rl.Config(flush_max_rows=2000, flush_interval_s=30))
+rl.init(config=rl.Config(flush_max_rows=2000, flush_interval_s=30, flush_timeout_s=30))
 ```
 
-### D2. Idempotent Delta appends (MVP)
+STARTED rows, ERROR events and suite results are durable immediately. Other events become durable at the next trigger, which may be the next log call or the end of the task.
 
-A retried flush never duplicates rows (Delta `txnAppId`/`txnVersion`). Tables are never auto-created.
+### D2. Idempotent Delta appends with stable batch identity (MVP) *(review A9)*
+
+- Each batch keeps the same identity (`runledger:{run_key}:{table}`, batch number) through retries, late commits and spill replay, so it is never written twice.
+- Tables are never auto-created.
+- Each table is acknowledged separately. The FINISHED row records rows sent and acknowledged, and `rl_v_delivery_completeness` shows any gaps.
 
 ```python
 rl.init(config=rl.Config(catalog="ops", schema="runledger", sinks=["delta", "stdlog"]))
 ```
 
-### D3. Schema check, circuit breaker and graceful fallback (MVP)
+```sql
+SELECT run_key, table_name, rows_sent, rows_present FROM rl_v_delivery_completeness WHERE rows_present < rows_sent;
+```
 
-If a table is missing or has the wrong shape, output falls back to stdout with a single hint. The job keeps running.
+### D3. Schema compatibility check, circuit breaker and graceful fallback (MVP) *(review A11, A12)*
+
+- A table is compatible if it has every column the client writes. Extra nullable columns, added by a newer migration, are fine.
+- A missing or incompatible table sends output to stdout with a single hint, and the job keeps running.
+- Fallback output carries identities and counts, never sample rows or sensitive attributes.
 
 ```text
 runledger: table ops.runledger.rl_events not found; writing to driver log instead. Run `runledger setup`.
@@ -387,7 +414,7 @@ rl.init(config=rl.Config(spill_path="/Volumes/ops/runledger/rl_spill"))
 |---|---|---|
 | Schema contract | MVP | `c.schema({"order_id": "bigint", "amount": "decimal(18,2)"}, allow_extra=True)` |
 | Not null | MVP | `c.not_null("order_id", "customer_id")` |
-| Unique (single or composite key) | MVP | `c.unique("order_id")` · `c.unique("account", "as_of_date")` |
+| Unique (single or composite key) | MVP | `c.unique("order_id")` · `c.unique("account", "as_of_date", basis="rows_in_duplicate_groups")` |
 | Row-count bounds | MVP | `c.row_count(min=1, max=50_000_000)` |
 | Accepted values | MVP | `c.accepted_values("status", ["NEW", "SHIPPED"])` |
 | Range | MVP | `c.in_range("amount", min=0, max=1_000_000)` |
@@ -396,15 +423,18 @@ rl.init(config=rl.Config(spill_path="/Volumes/ops/runledger/rl_spill"))
 | Freshness | v1 | `c.freshness("updated_at", max_age="6h")` |
 | Null ratio | v1 | `c.null_ratio("phone", max=0.2)` |
 | Statistic bounds | v1 | `c.stat_bounds("amount", mean=(90, 110), sum=(1e6, None))` |
+| Referential integrity *(review B6)* | v1 | `c.references("customer_id", "main.ref.customers", "id")` (null keys skipped unless `allow_null=False`) |
 | Custom SQL | v1 | `c.sql("SELECT count(*) FROM {df} WHERE amount < 0", max=0)` |
 | Source/target reconciliation | v1 | `c.reconcile(source=lambda: spark.table("raw.orders"), keys=["order_id"], measures=["amount"])` |
 
+**Uniqueness reports three numbers** *(review A13)*. For keys `[A, A, B]` they are `duplicate_keys=1`, `excess_rows=1` and `rows_in_duplicate_groups=2`. Tolerances say which basis they use (default `excess_rows`), and the result stores it.
+
 ### E3. Severity policy (MVP)
 
-| Severity | Effect |
+| Severity | When the rule fails, or can't be evaluated *(review A1)* |
 |---|---|
 | `info` | Recorded only |
-| `warn` | Task WARNED |
+| `warn` | Quality status WARNED |
 | `error` | Raises `ValidationFailed` after the whole suite runs |
 | `critical` | Raises `ValidationHalted` |
 
@@ -419,17 +449,33 @@ rl.init(validation=rl.ValidationPolicy(fail_on="critical"))  # e.g. looser in de
 ### E4. Tolerances (MVP)
 
 ```python
-c.not_null("phone", mostly=0.95)  # pass if at least 95% of rows are non-null
+c.not_null("phone", mostly=0.95)          # pass if at least 95% of rows are non-null
 c.in_range("amount", min=0, max_failures=10)
 ```
 
-### E5. Observe mode for rolling out new rules (MVP)
+Tolerances work in jobs and in aggregate checks. They can't be expressed as LDP row expectations, so `@rlp.expectations` rejects them with a clear message.
 
-Results are recorded and nothing fails.
+### E5. Evaluate, enforce and notify: three separate settings (MVP) *(review A15)*
+
+| Setting | Off means |
+|---|---|
+| `evaluate` | checks don't run; no Spark cost |
+| `enforce` | results are recorded, nothing raises (observe mode for new rules) |
+| `notify` | results never trigger alerts |
 
 ```python
-rl.init(validation=rl.ValidationPolicy(enforce=False))  # or RUNLEDGER_VALIDATION_ENFORCE=false
+rl.init(validation=rl.ValidationPolicy(enforce=False))         # observe mode: run and record
 ```
+
+```python
+rl.init(validation=rl.ValidationPolicy(evaluate=False))        # e.g. a fast dev loop: skip checks
+```
+
+```bash
+RUNLEDGER_VALIDATION_NOTIFY=false
+```
+
+Every result stores the policy in effect, and alerts only consider results with `enforce` and `notify` on.
 
 ### E6. Manual handling (MVP)
 
@@ -442,26 +488,27 @@ if not result.passed:
 ### E7. Validation decorators (MVP)
 
 ```python
-@rl.expect(c.not_null("order_id"), c.row_count(min=1))  # validates the returned DataFrame
+@rl.expect(c.not_null("order_id"), c.row_count(min=1))   # validates the returned DataFrame
 def clean(df): ...
 
-
-@rl.expect_input("df", orders_suite)  # validates an argument first
+@rl.expect_input("df", orders_suite)                       # validates an argument first
 def publish(df): ...
 ```
 
-### E8. Reusable, versioned, serializable suites (MVP)
+A decorator triggers Spark work when the function returns. Use `suite.explain(df)` (E14) to see that work in advance. To gate a write, prefer the publish gate (E13).
+
+### E8. Reusable, versioned, serializable suites with stable rule identity (MVP) *(review B7)*
 
 ```python
-orders_suite = rl.Suite(
-    name="orders_silver",
-    version="3",
-    dataset="main.silver.orders",
-    rules=[c.not_null("order_id"), c.unique("order_id")],
-)
+orders_suite = rl.Suite(name="orders_silver", version="3", dataset="main.silver.orders",
+                        rules=[c.not_null("order_id", key="orders.id_present"),
+                               c.unique("order_id")])
 orders_suite.run(df)
-orders_suite.to_dict()  # JSON-safe; the basis for YAML suites later
+orders_suite.to_dict()            # JSON-safe; the basis for YAML suites later
 ```
+
+- `key` is the rule's stable business identity. It is derived automatically when it isn't given.
+- `definition_hash` changes when a threshold changes, so history stays continuous and every change stays visible.
 
 ### E9. Failing-row samples (v1)
 
@@ -474,10 +521,12 @@ rl.validate(df, sample_rows=20, sample_columns=["order_id", "status"]).not_null(
 ### E10. Quarantine split (v1)
 
 ```python
-good, bad = orders_suite.split(df)  # bad has an _rl_failed_rules column
+good, bad = orders_suite.split(df)        # bad has an _rl_failed_rules column
 bad.write.mode("append").saveAsTable("main.quarantine.orders")
 good.write.mode("overwrite").saveAsTable("main.silver.orders")
 ```
+
+For uniqueness, every row in a duplicate group goes to `bad` by default. Use `c.unique("order_id", keep="first")` to keep one row per key.
 
 ### E11. Condition-task integration (v1)
 
@@ -496,39 +545,97 @@ condition_task:
 rl.validate(df, where="as_of_date = '2026-11-10'").unique("id", approx=True).run()
 ```
 
+Approximate uniqueness is **observational**: it can warn, but it never blocks *(review A13)*.
+
+### E13. Write-audit-publish gate (v1; MVP candidate) *(review A14)*
+
+The suite validates exactly the data that will be published. If an enforced rule fails, the target is left untouched.
+
+```python
+with rl.publish_gate("main.silver.orders", suite=orders_suite) as gate:
+    gate.write(clean(raw))           # 1. write to staging
+# 2. audit: the suite runs on that exact Delta version
+# 3. publish: the target is updated only if no enforced rule failed; otherwise ValidationFailed
+```
+
+### E14. `suite.explain(df)`: see the validation plan before running (MVP) *(review B5)*
+
+```python
+orders_suite.explain(df)
+```
+```text
+1 Spark pass (aggregate): not_null(order_id), row_count, unique(order_id) [exact]
++1 pass only if duplicates are found: rows_in_duplicate_groups
++1 pass only if a row rule fails: failing-row samples (20/rule)
+Columns read: order_id, status, amount   Filter: as_of_date = '2026-11-10'
+```
+
+### E15. Validation scope recorded with every result (MVP) *(review B1)*
+
+Each result records the population it judged:
+- the filter and sample fraction
+- approx flags
+- the source table and its Delta version
+- the engine and library version
+
+```sql
+SELECT rule_key, observed_value, scope:source_version FROM rl_validation_results
+WHERE dataset = 'main.silver.orders' AND scope:filter = 'as_of_date = current_date()';
+```
+
+### E16. Rule errors are isolated and fail closed (MVP) *(review A1)*
+
+- A broken rule doesn't silence the others. Preflight catches missing columns and type errors without running a Spark job.
+- When a runtime error happens, the rules are re-run in halves to find the culprit.
+- An `error` or `critical` rule that can't be evaluated counts as a failure.
+
+```text
+rule orders.amount_positive -> ERROR (analysis: column `amount_usd` not found)   [fails closed: severity=error]
+rule orders.id_present      -> PASS
+rule orders.id_unique       -> PASS
+```
+
 ---
 
 ## F. Lakeflow Declarative Pipelines (LDP)
 
-### F1. Export row rules as expectations (v1)
+### F1. Export row rules as expectations (v1) *(review A2)*
+
+Severity and pipeline action are separate:
+- By default `warn` → keep rows and record, and `error`/`critical` → fail the update.
+- Rows are dropped only when a rule asks for it explicitly.
 
 ```python
 from pyspark import pipelines as dp
 import lakehouse_runledger.ldp as rlp
 
-
 @dp.table(name="orders_silver")
-@rlp.expectations(orders_suite)  # warn→expect_all, error→or_drop, critical→or_fail
+@rlp.expectations(orders_suite)                      # error -> expect_or_fail (never silently drop)
 def orders_silver():
     return spark.readStream.table("orders_bronze")
+
+c.accepted_values("status", ["NEW", "SHIPPED"], ldp_action="drop")   # explicit opt-in to dropping
 ```
 
-### F2. Aggregate checks inside a pipeline (v1)
+### F2. Aggregate checks inside a pipeline (v1, observational) *(review A3)*
 
 `row_count`, `unique`, `freshness` and `reconcile` run as a private materialized view.
+
+These checks **observe** the published data. They can't stop publication. For gating, add a validation task between the pipeline and its consumers, or use the publish gate (E13).
 
 ```python
 rlp.aggregate_checks(orders_suite, source="orders_silver")
 ```
 
-### F3. Event-log ingestion (v1)
+### F3. Event-log ingestion (v1) *(review A4)*
 
-Pipeline expectation results and update status flow into the same tables as job results.
+Pipeline expectation results, update status and update errors flow into the same tables as job results. The task runs even when the pipeline fails. Counts the pipeline didn't record are stored as NULL with a reason, never as 0.
 
 ```yaml
 - task_key: ingest_pipeline_results
   depends_on: [{task_key: run_pipeline}]
-  python_wheel_task: {package_name: runledger, entry_point: runledger,
+  run_if: ALL_DONE
+  python_wheel_task: {package_name: lakehouse_runledger, entry_point: runledger,
                       parameters: ["ingest-pipeline", "--pipeline-id", "${resources.pipelines.orders.id}"]}
 ```
 
@@ -560,25 +667,64 @@ runledger manifest build
 runledger manifest sync       # appends a new manifest_version to rl_manifest
 ```
 
-### G2. A reconciler that flags missing and early-failed runs (MVP; some statuses in v1)
+### G2. A reconciler that reports only what the evidence supports (MVP; some verdicts in v1) *(review A5, A6, A7)*
 
-| Status | Meaning |
+Each verdict carries a confidence: CONFIRMED, INFERRED or UNKNOWN.
+
+| Verdict | Meaning |
 |---|---|
-| `MISSED_SCHEDULE` | No run started in the expected window |
-| `FAILED_BEFORE_INIT` | Cluster, library install or import failed before `rl.init()` |
-| `UNINSTRUMENTED` | Ran, but doesn't use runledger yet |
-| `SKIPPED_UPSTREAM` (v1) | Skipped by `run_if` or an upstream failure |
+| `MISSED_SCHEDULE` | No job run matched the expected slot (requires a complete API scan) |
+| `EXCLUDED` | The task's `run_if` excluded it, e.g. a failure handler on a good run (info, never alerts) |
+| `UPSTREAM_FAILED` | Not run because an upstream task failed |
+| `PENDING` | Waiting on upstream tasks that are still running (not late) |
+| `FAILED_BEFORE_INIT` | The platform says the task failed, and there's no STARTED row while the logging path was healthy |
+| `UNINSTRUMENTED` | Ran, but doesn't use runledger yet (info) |
+| `TELEMETRY_GAP` | Our records are missing or incomplete, and the cause isn't proven |
+| `OBSERVATION_INCOMPLETE` | The platform data couldn't be read completely; no conclusion |
+| `CRASHED` (v1) | STARTED, never FINISHED, and the platform says the task failed |
 | `SLA_BREACH` (v1) | Still running past the SLA |
-| `CRASHED` (v1) | STARTED, never FINISHED, and the platform says it ended |
 
 ```sql
-SELECT * FROM rl_v_expected_vs_actual WHERE outcome <> 'OK' AND slot_ts > now() - INTERVAL 1 DAY;
+SELECT slot_key, verdict, cause_confidence FROM rl_v_expected_vs_actual
+WHERE verdict NOT IN ('OK', 'EXCLUDED', 'PENDING') AND slot_ts > now() - INTERVAL 1 DAY;
 ```
+
+Verdicts can be superseded. A slot marked missed that later matches a delayed run is updated, and the history is kept.
 
 ### G3. Jobs outside a bundle (v1)
 
 ```bash
 runledger manifest add --job-id 123 --sla 2h --schedule "0 0 6 * * ?" --tz America/Chicago
+```
+
+### G4. Shadow mode and explanations (MVP) *(review B3)*
+
+New jobs are observed without alerting for a trial period, so teams can check verdicts before anyone is paged. Every verdict can be explained.
+
+```bash
+runledger reconcile preview --job orders_daily          # upcoming expected slots
+```
+
+```bash
+runledger reconcile explain expected:1234:987:publish:2026-11-10T06:00
+```
+```text
+verdict EXCLUDED (CONFIRMED)
+  manifest v14 (effective 2026-11-01): publish depends_on [validate], run_if ALL_SUCCESS
+  matched job run 5551 (triggered 06:00:04); validate result_state FAILED -> publish not eligible
+  -> reclassified as UPSTREAM_FAILED
+```
+
+### G5. Canary (MVP) *(review B2)*
+
+A tiny scheduled job writes a known record through the library, then checks that it reaches the views. It also checks that the reconciler ran recently.
+- If either goes stale, a separate alert fires.
+- Canary health is the evidence that lets "failed before init" be INFERRED instead of UNKNOWN.
+
+```yaml
+resources:
+  jobs:
+    runledger_canary: {schedule: {quartz_cron_expression: "0 */15 * * * ?", timezone_id: UTC}}
 ```
 
 ---
@@ -613,11 +759,12 @@ add_columns_sql(EVENTS, spark.table("ops.runledger.rl_events").columns, "ops", "
 
 | View | What it shows |
 |---|---|
-| `rl_v_task_runs` | Current status per run |
-| `rl_v_job_runs` | Worst status per job run |
-| `rl_v_validation_latest` | Latest result per rule |
+| `rl_v_task_runs` | Current status per task, using the effective attempt (repairs handled) |
+| `rl_v_job_runs` | Worst effective-attempt status per job run |
+| `rl_v_validation_latest` | Latest result per `rule_key` |
 | `rl_v_failure_groups` | Failures grouped by fingerprint |
-| `rl_v_expected_vs_actual` | Expected runs vs what happened |
+| `rl_v_expected_vs_actual` | Latest verdict per expected slot |
+| `rl_v_delivery_completeness` | Rows reported vs rows present, per task and table |
 
 ```sql
 SELECT fingerprint, error_class, count, last_seen FROM rl_v_failure_groups ORDER BY count DESC;
@@ -645,15 +792,19 @@ The dashboard has four pages:
 - **Data quality:** pass rates, observed-value trends, samples
 - **Delivery health**
 
-### H6. Databricks SQL alerts (v1)
+### H6. Databricks SQL alerts (v1; one alert in MVP)
 
-Alerts go to email, Teams or Slack through notification destinations.
+Alerts go to email, Teams or Slack through notification destinations. Validation alerts only consider results with `enforce` and `notify` on. Reconciler alerts skip shadow-mode slots and UNKNOWN verdicts.
 
 ```sql
--- "Critical validation failure in the last 15 minutes"
+-- "Critical validation failure in the last 15 minutes" (includes rules that couldn't be evaluated)
 SELECT count(*) AS failures FROM rl_validation_results
-WHERE outcome = 'FAIL' AND severity = 'critical' AND evaluated_at > now() - INTERVAL 15 MINUTES;
+WHERE outcome IN ('FAIL', 'ERROR') AND severity = 'critical'
+  AND effective_policy.enforce AND effective_policy.notify
+  AND evaluated_at > now() - INTERVAL 15 MINUTES;
 ```
+
+The MVP ships one alert: an expected run that is missing or failed before init, at CONFIRMED or INFERRED confidence. The canary has its own staleness alert.
 
 ### H7. Retention and maintenance job (v1)
 
