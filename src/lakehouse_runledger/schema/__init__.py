@@ -1,12 +1,12 @@
 """Table specs (single source of truth) and DDL generation."""
 
-from runledger.schema.ddl import (
+from lakehouse_runledger.schema.ddl import (
     add_columns_sql,
     create_table_sql,
     render_tables_script,
     table_fqn,
 )
-from runledger.schema.tables import (
+from lakehouse_runledger.schema.tables import (
     ALL_TABLES,
     EVENTS,
     MANIFEST,

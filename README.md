@@ -1,8 +1,11 @@
-# runledger
+# lakehouse_runledger
 
 Event logging and first-class data validation for **Databricks Workflows** (Lakeflow Jobs):
 serverless, classic job clusters and Lakeflow Declarative Pipelines.
 
+> Install as `lakehouse-runledger`, import as `lakehouse_runledger` (alias `rl`). The CLI, table
+> prefix (`rl_`), env vars (`RUNLEDGER_*`) and config keys use the short name **runledger**.
+>
 > Status: **pre-alpha**. Only the table specs and `runledger ddl` exist so far.
 > See [docs/design.md](docs/design.md) for the design and roadmap, and
 > [docs/features.md](docs/features.md) for every feature with an example.
@@ -10,8 +13,8 @@ serverless, classic job clusters and Lakeflow Declarative Pipelines.
 ## The idea in 30 seconds
 
 ```python
-import runledger as rl
-from runledger import checks as c
+import lakehouse_runledger as rl
+from lakehouse_runledger import checks as c
 
 
 @rl.task  # STARTED/FINISHED, status, duration, errors

@@ -9,7 +9,7 @@ Each feature comes with a short example. The **Phase** column follows the roadma
 | **v1** | 1.0 |
 | **Later** | planned after 1.0 |
 
-Examples assume `import runledger as rl` and `from runledger import checks as c`.
+Examples assume `import lakehouse_runledger as rl` and `from lakehouse_runledger import checks as c`.
 
 ## Contents
 
@@ -49,7 +49,7 @@ The first cell is the only change. It does five things:
 - writes FINISHED when the notebook ends or fails
 
 ```python
-import runledger.auto
+import lakehouse_runledger.auto
 ```
 
 ### A3. `@rl.task`: instrument a wheel or script entry point (MVP)
@@ -116,7 +116,7 @@ The mutator injects `runledger_ctx` and the library dependency into every task i
 # databricks.yml
 python:
   mutators:
-    - "runledger.bundle:inject_context"
+    - "lakehouse_runledger.bundle:inject_context"
 ```
 
 ### A9. `runledger doctor` (MVP)
@@ -505,7 +505,7 @@ rl.validate(df, where="as_of_date = '2026-11-10'").unique("id", approx=True).run
 
 ```python
 from pyspark import pipelines as dp
-import runledger.ldp as rlp
+import lakehouse_runledger.ldp as rlp
 
 
 @dp.table(name="orders_silver")
@@ -605,7 +605,7 @@ runledger ddl --catalog ops --schema runledger > 01_tables.sql
 ### H2. Additive schema migrations (**Built** as a library function; CLI in MVP)
 
 ```python
-from runledger.schema import EVENTS, add_columns_sql
+from lakehouse_runledger.schema import EVENTS, add_columns_sql
 
 add_columns_sql(EVENTS, spark.table("ops.runledger.rl_events").columns, "ops", "runledger")
 ```

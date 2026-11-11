@@ -26,9 +26,9 @@ No code, schema or module layout is carried over.
 - Webhooks later, through a `Notifier` seam.
 - Python-first validation now; rules serializable so YAML suites can come later.
 - Config in code, overridable by env vars and job params, plus a Declarative Automation Bundle (DAB) template.
-- Working name **`runledger`**. Renaming is cheap, and the PyPI name still has to be checked.
+- Name: distribution `lakehouse-runledger`, import package `lakehouse_runledger` (used as `import lakehouse_runledger as rl`). The short name **runledger** is kept for the CLI (`runledger ...`), the `rl_` table prefix, `RUNLEDGER_*` env vars and `runledger.*` config keys and table properties.
 
-**Location:** a new repo at `C:\Users\aarba\pydev\runledger` (sibling of this repo). The first commit adds this plan as `docs/design.md`.
+**Location:** `C:\Users\aarba\pydev\lakehouse_runledger`, remote https://github.com/arbaizam/lakehouse_runledger. This plan lives in the repo as `docs/design.md`.
 
 ---
 
@@ -52,7 +52,7 @@ No code, schema or module layout is carried over.
 ```
 runledger/
   pyproject.toml            hatchling; extras [sdk]=databricks-sdk, [dev]=pytest,hypothesis,ruff,pyspark,delta-spark
-  src/runledger/
+  src/lakehouse_runledger/
     api.py                  ambient functions: init, current, span, info/warn/error, metric, validate, finish, task
     config.py               frozen Config + precedence merge + provenance (which source set each field)
     errors.py               ConfigError, SinkError(retryable), ValidationFailed, ValidationHalted
@@ -80,7 +80,7 @@ Additions for ease of use and never-start detection:
 
 ```
     decorators.py           @rl.task, @rl.step, @rl.expect, @rl.expect_input (thin wrappers over api.py)
-    notebook.py             `import runledger.auto`, per-cell spans (IPython events), %%rl_step cell magic
+    notebook.py             `import lakehouse_runledger.auto`, per-cell spans (IPython events), %%rl_step cell magic
     logbridge.py            logging.Handler + warnings capture → rl_events
     manifest/               model (ExpectedTask, Schedule, SLA, ExpectedDataset), build-from-bundle,
                             sync (writes rl_manifest), reconcile (manifest × rl_task_runs × system tables)
@@ -358,7 +358,7 @@ The plan is progressive disclosure: each rung adds value, and a team can stop on
 |---|---|---|---|
 | 0 · Observe | **0 lines** (deploy template) | nothing | Manifest + reconciler: expected vs actual runs, missed schedules, failures before init, durations from system tables |
 | 1 · Wire | **0 lines** with the bundle mutator | nothing. The mutator injects `runledger_ctx` and the library dependency into every task | Context for later rungs. No hand-written `{{job.run_id}}` parameters |
-| 2 · Turn on | **1 line** | `import runledger.auto` (notebook) or `@rl.task` (wheel) | STARTED/FINISHED, status, duration, error class and fingerprint, existing `logging`/`warnings` captured into `rl_events` |
+| 2 · Turn on | **1 line** | `import lakehouse_runledger.auto` (notebook) or `@rl.task` (wheel) | STARTED/FINISHED, status, duration, error class and fingerprint, existing `logging`/`warnings` captured into `rl_events` |
 | 3 · Decorate | 1 line per function | `@rl.step`, `@rl.expect(...)` | Per-step spans and timing; validation of returned DataFrames |
 | 4 · Explicit | as needed | `with rl.span()`, `rl.metric()`, `rl.validate(df)...run()` | Fine-grained control, custom metrics |
 | 5 · Reuse | shared module | `Suite(...)` objects, LDP export, later YAML | Governed, versioned rules across teams |
@@ -368,17 +368,17 @@ The plan is progressive disclosure: each rung adds value, and a team can stop on
 ```python
 # Notebook: the first cell is the only change. It reads widgets/env, writes STARTED, installs exit hooks,
 # and bridges `logging` (WARNING+ by default).
-import runledger.auto
+import lakehouse_runledger.auto
 ```
 ```python
 # Opt-in: every notebook cell becomes a span, using IPython pre/post_run_cell events (no other code)
-import runledger as rl
+import lakehouse_runledger as rl
 
 rl.init(cell_spans=True)
 ```
 ```python
 # Wheel / script
-import runledger as rl
+import lakehouse_runledger as rl
 
 
 @rl.task  # works bare or as @rl.task(app_name=...)
@@ -388,8 +388,8 @@ def main(): ...
 ### Rung 3: decorators (the main "easy" API)
 
 ```python
-import runledger as rl
-from runledger import checks as c
+import lakehouse_runledger as rl
+from lakehouse_runledger import checks as c
 
 
 @rl.task
@@ -432,7 +432,7 @@ df = spark.table("main.raw.orders")                 # notebook cell magic = a sp
 
 ### Ways to make it feel easy
 
-- **One import, one name:** `import runledger as rl`.
+- **One import, one name:** `import lakehouse_runledger as rl`.
 - Type hints and docstrings on everything, so autocomplete is the documentation.
 - **Zero-config locally:** the console sink runs when there's no Databricks.
 - **Safe on Databricks before setup:** if the `rl_*` tables don't exist, output degrades to stdout with a single "run `runledger setup`" hint instead of an error.
@@ -442,7 +442,7 @@ df = spark.table("main.raw.orders")                 # notebook cell magic = a sp
 
 ### Trade-offs to keep in mind
 
-- `runledger.auto` runs on import, so it is a separate module. `import runledger` alone has **no** side effects.
+- `lakehouse_runledger.auto` runs on import, so it is a separate module. `import lakehouse_runledger` alone has **no** side effects.
 - `cell_spans` can be noisy, so it is opt-in.
 - `@rl.expect` on a lazily evaluated DataFrame triggers a Spark job at return. The docs say so, and it can be turned off globally with `RUNLEDGER_VALIDATION_ENFORCE=false`.
 - Auto-instrumenting `DataFrameWriter` (monkey-patching writes) is deliberately **not** planned. It is fragile under Spark Connect and surprising. It may become an explicit opt-in later.
@@ -454,7 +454,7 @@ df = spark.table("main.raw.orders")                 # notebook cell magic = a sp
 **1. Notebook task**
 
 ```python
-import runledger as rl
+import lakehouse_runledger as rl
 
 rl.init(app_name="orders_etl")  # resolve config+context, write STARTED, install hooks
 
@@ -475,7 +475,7 @@ rl.finish()  # optional; idempotent
 **2. Python wheel task**
 
 ```python
-import runledger as rl
+import lakehouse_runledger as rl
 
 
 @rl.task(app_name="orders_etl")  # init + finish + reads --runledger_ctx from argv
@@ -487,7 +487,7 @@ def main():
 **3. Reusable, serializable suite**
 
 ```python
-from runledger import Suite, checks as c
+from lakehouse_runledger import Suite, checks as c
 
 orders_suite = Suite(
     name="orders_silver",
@@ -560,7 +560,7 @@ databricks bundle run runledger_setup -t dev               # creates rl_* tables
 
 ```python
 from pyspark import pipelines as dp
-import runledger as rl, runledger.ldp as rlp
+import lakehouse_runledger as rl, lakehouse_runledger.ldp as rlp
 
 rl.init()  # detects LDP → stdlog only
 
@@ -583,7 +583,7 @@ rlp.aggregate_checks(orders_suite, source="orders_silver")
 ## DAB template (`bundle_template/`)
 
 - **`databricks.yml`:** dev/prod targets and the `runledger_ctx` variable.
-- **`runledger.schema.yml`:** the schema plus Volumes for spill and checkpoints.
+- **`lakehouse_runledger.schema.yml`:** the schema plus Volumes for spill and checkpoints.
 - **`runledger_setup.job.yml`:** serverless SQL tasks that run `01_tables.sql`, `02_views.sql` and `03_grants.sql`. These files are generated by `runledger ddl` from `schema/tables.py`, and CI checks they haven't drifted.
 - **`runledger_maintenance.job.yml`:** daily retention deletes, `ingest-pipeline`, and spill recovery.
 - **`runledger_reconciler.job.yml`:** every 15 min on serverless, running `runledger reconcile`. The setup job also runs `runledger manifest sync` on each deploy.
@@ -626,7 +626,7 @@ The findings go into `docs/platform-notes.md`, and each one has a fallback ready
 - the four main tables and their views; STARTED/FINISHED for notebook and wheel tasks
 - validation: schema, not_null, unique, row_count, accepted_values, in_range, expr, compiled to a single pass, with the severity policy and observe mode
 - CLI `ddl` and `doctor`; a minimal DAB (schema, setup job, example job)
-- the easy layer: `import runledger.auto`, `@rl.task`, `@rl.step`, `@rl.expect` / `@rl.expect_input`, and the logging bridge
+- the easy layer: `import lakehouse_runledger.auto`, `@rl.task`, `@rl.step`, `@rl.expect` / `@rl.expect_input`, and the logging bridge
 - manifest v0: `manifest build` + `sync` from the bundle, plus a reconciler that uses the Jobs API to detect MISSED_SCHEDULE, FAILED_BEFORE_INIT and UNINSTRUMENTED, and `rl_v_expected_vs_actual`. Never-start detection is in the MVP because it is the zero-code entry point.
 
 **Phase 2: v1.0**
@@ -705,7 +705,7 @@ The findings go into `docs/platform-notes.md`, and each one has a fallback ready
     - a paused scheduled job
 
     Assert the reconciler emits FAILED_BEFORE_INIT, SKIPPED_UPSTREAM and MISSED_SCHEDULE within one reconcile interval, and stays idempotent on re-run.
-  - Ease-of-use check: a fresh notebook containing only `import runledger.auto`, plus a decorated wheel, produce complete rows with no other configuration.
+  - Ease-of-use check: a fresh notebook containing only `import lakehouse_runledger.auto`, plus a decorated wheel, produce complete rows with no other configuration.
 - **Performance gate:** 10k events plus a 10-rule suite on 10M rows. Validation uses one Spark job when every rule passes, and commits stay within budget.
 
 ## First implementation steps (after approval)

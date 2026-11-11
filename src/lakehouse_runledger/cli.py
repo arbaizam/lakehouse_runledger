@@ -11,11 +11,11 @@ import sys
 from collections.abc import Sequence
 from pathlib import Path
 
-from runledger._version import __version__
+from lakehouse_runledger._version import __version__
 
 
 def _cmd_ddl(args: argparse.Namespace) -> int:
-    from runledger.schema.ddl import render_tables_script
+    from lakehouse_runledger.schema.ddl import render_tables_script
 
     script = render_tables_script(args.catalog, args.schema, args.prefix)
     if args.out:

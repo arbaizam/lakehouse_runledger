@@ -1,7 +1,13 @@
 import pytest
 
-from runledger.schema import ALL_TABLES, SCHEMA_VERSION_PROPERTY, TABLES_BY_KEY, Column, TableSpec
-from runledger.schema.tables import TASK_RUNS
+from lakehouse_runledger.schema import (
+    ALL_TABLES,
+    SCHEMA_VERSION_PROPERTY,
+    TABLES_BY_KEY,
+    Column,
+    TableSpec,
+)
+from lakehouse_runledger.schema.tables import TASK_RUNS
 
 RUN_SCOPED = [t for t in ALL_TABLES if t.key != "manifest"]
 
@@ -27,7 +33,7 @@ def test_every_table_carries_schema_version(spec):
 
 
 def test_validation_evidence_is_typed_not_json_strings():
-    from runledger.schema import VALIDATION_RESULTS
+    from lakehouse_runledger.schema import VALIDATION_RESULTS
 
     assert VALIDATION_RESULTS.column("failed_rows").type == "BIGINT"
     assert VALIDATION_RESULTS.column("observed_value").type == "DOUBLE"

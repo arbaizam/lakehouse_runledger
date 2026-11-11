@@ -3,7 +3,7 @@ requires = ["hatchling>=1.25"]
 build-backend = "hatchling.build"
 
 [project]
-name = "runledger"
+name = "lakehouse-runledger"
 dynamic = ["version"]
 description = "Event logging and first-class data validation for Databricks Workflows."
 readme = "README.md"
@@ -19,13 +19,13 @@ dev = ["pytest>=8", "hypothesis>=6", "ruff>=0.6"]
 spark-test = ["pyspark>=3.5", "delta-spark>=3.2"]
 
 [project.scripts]
-runledger = "runledger.cli:main"
+runledger = "lakehouse_runledger.cli:main"
 
 [tool.hatch.version]
-path = "src/runledger/_version.py"
+path = "src/lakehouse_runledger/_version.py"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/runledger"]
+packages = ["src/lakehouse_runledger"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

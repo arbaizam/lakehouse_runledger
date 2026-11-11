@@ -10,8 +10,8 @@ from __future__ import annotations
 import re
 from collections.abc import Iterable
 
-from runledger._version import __version__
-from runledger.schema.tables import ALL_TABLES, Column, TableSpec
+from lakehouse_runledger._version import __version__
+from lakehouse_runledger.schema.tables import ALL_TABLES, Column, TableSpec
 
 _IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _PREFIX = re.compile(r"^[A-Za-z0-9_]*$")

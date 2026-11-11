@@ -5,9 +5,9 @@ from pathlib import Path
 
 import pytest
 
-from runledger.cli import main
-from runledger.schema import ALL_TABLES, EVENTS, TASK_RUNS
-from runledger.schema.ddl import (
+from lakehouse_runledger.cli import main
+from lakehouse_runledger.schema import ALL_TABLES, EVENTS, TASK_RUNS
+from lakehouse_runledger.schema.ddl import (
     add_columns_sql,
     create_table_sql,
     render_tables_script,
@@ -97,7 +97,7 @@ def test_cli_ddl_reports_bad_identifier(capsys):
 
 def test_import_has_no_side_effects_and_no_pyspark():
     code = (
-        "import sys, runledger, runledger.schema, runledger.cli;"
+        "import sys, lakehouse_runledger, lakehouse_runledger.schema, lakehouse_runledger.cli;"
         "assert not any(m == 'pyspark' or m.startswith('pyspark.') for m in sys.modules)"
     )
     subprocess.run([sys.executable, "-c", code], check=True)
