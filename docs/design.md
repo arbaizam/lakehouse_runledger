@@ -1,5 +1,7 @@
-# runledger — a Databricks Workflows event + data-validation logger
+# lakehouse_runledger: a Databricks Workflows event + data-validation logger
 
+> **Status: planning.** Nothing is implemented. The plan is under review; see
+> [review-brief.md](review-brief.md) for the decision log, open questions and the review agenda.
 > Every feature, with an example, is listed in [features.md](features.md).
 
 ## Context
@@ -708,7 +710,7 @@ The findings go into `docs/platform-notes.md`, and each one has a fallback ready
   - Ease-of-use check: a fresh notebook containing only `import lakehouse_runledger.auto`, plus a decorated wheel, produce complete rows with no other configuration.
 - **Performance gate:** 10k events plus a 10-rule suite on 10M rows. Validation uses one Spark job when every rule passes, and commits stay within budget.
 
-## First implementation steps (after approval)
+## First implementation steps (after the design review and Phase 0 spike)
 
 1. Create `C:\Users\aarba\pydev\runledger`: git init, `pyproject.toml`, src layout, ruff/pytest config, and this plan as `docs/design.md`.
 2. Write `schema/tables.py` and `ddl.py` first, since everything else derives from them.

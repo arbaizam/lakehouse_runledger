@@ -4,7 +4,6 @@ Each feature comes with a short example. The **Phase** column follows the roadma
 
 | Phase | Meaning |
 |---|---|
-| **Built** | exists in this repo today |
 | **MVP** | 0.1 |
 | **v1** | 1.0 |
 | **Later** | planned after 1.0 |
@@ -586,7 +585,7 @@ runledger manifest add --job-id 123 --sla 2h --schedule "0 0 6 * * ?" --tz Ameri
 
 ## H. Storage, dashboards and alerts
 
-### H1. Typed Unity Catalog tables and DDL (**Built**)
+### H1. Typed Unity Catalog tables and DDL (MVP)
 
 There are six tables, all generated from one spec module:
 - `rl_task_runs`
@@ -602,7 +601,7 @@ They use liquid clustering and carry a schema-version property.
 runledger ddl --catalog ops --schema runledger > 01_tables.sql
 ```
 
-### H2. Additive schema migrations (**Built** as a library function; CLI in MVP)
+### H2. Additive schema migrations (MVP)
 
 ```python
 from lakehouse_runledger.schema import EVENTS, add_columns_sql

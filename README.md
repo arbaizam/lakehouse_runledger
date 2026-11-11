@@ -6,11 +6,12 @@ serverless, classic job clusters and Lakeflow Declarative Pipelines.
 > Install as `lakehouse-runledger`, import as `lakehouse_runledger` (alias `rl`). The CLI, table
 > prefix (`rl_`), env vars (`RUNLEDGER_*`) and config keys use the short name **runledger**.
 >
-> Status: **pre-alpha**. Only the table specs and `runledger ddl` exist so far.
+> Status: **planning**. This repo holds design documents only; no code yet.
 > See [docs/design.md](docs/design.md) for the design and roadmap, and
-> [docs/features.md](docs/features.md) for every feature with an example.
+> [docs/features.md](docs/features.md) for every feature with an example, and
+> [docs/review-brief.md](docs/review-brief.md) for open decisions and questions.
 
-## The idea in 30 seconds
+## The idea in 30 seconds (proposed API)
 
 ```python
 import lakehouse_runledger as rl
@@ -37,11 +38,3 @@ Results land in Unity Catalog Delta tables (`rl_task_runs`, `rl_events`, `rl_met
 `rl_validation_results`, …). A bundle template adds a dashboard, SQL alerts and a reconciler
 that also catches tasks that **never started**.
 
-## Development
-
-```bash
-python -m venv .venv
-.venv/Scripts/python -m pip install -e ".[dev]"
-.venv/Scripts/python -m pytest
-runledger ddl --catalog main --schema ops
-```
