@@ -1,444 +1,478 @@
-# runledger governance
+# Governance
 
-> **Status: proposal** for the design review. Nothing here is decided. It builds on controls the
-> design already has ([design.md](design.md)), names the gaps, and suggests the least process that
-> keeps hundreds of jobs consistent with a small team. Open questions are in [§12](#12-open-questions-for-the-review).
+> **Status: proposal** for the design review. Nothing here is decided yet.
+> Open questions are in [§11](#11-open-questions).
 
-## In short
+## The idea on one page
 
-A small team running hundreds of jobs can't govern by reviewing jobs. Governance has to live in the
-bundle template, the manifest and CI, and be measured with the ledger's own tables.
+We are a small team running hundreds of jobs. We can't check each job by hand, so the rules live
+in **files, CI checks and one dashboard**, not in meetings.
 
-If we do only five things before the pilot:
+```mermaid
+flowchart LR
+  T["Bundle template<br/>safe defaults"] --> Y["runledger.yml<br/>owner · tier · SLA"]
+  Y --> C{"CI check<br/>manifest build --strict"}
+  C -->|fails| Y
+  C -->|passes| D["Deploy from main"]
+  D --> L[("rl_* tables")]
+  L --> S["Scorecard"]
+  S --> M["Monthly review<br/>30 min"]
+  M -->|fix gaps| Y
+```
 
-1. **Name the people.** A product owner, at least two maintainers, and an owner for every job.
-2. **Detect contract changes automatically.** Snapshot tests on schemas, enums, keys and the public
-   API, with CODEOWNERS requiring two maintainers ([§4](#4-change-control)).
-3. **Give criticality a meaning.** `high` / `medium` / `low` with minimum standards, checked by
-   `runledger manifest build --strict` in CI ([§6](#6-job-standards-by-criticality)).
-4. **Control the version.** One pinned `runledger_version` per target, rolled out in rings, with
-   the version recorded on every run ([§5](#5-versions-compatibility-and-rollout)).
-5. **Lock down access and write the kill-switch runbook.** A grants model where jobs can report
-   on themselves but can't change what was expected of them ([§8](#8-access-retention-and-operations)).
-
-The scorecard, rule lifecycle, alert routing and retention follow in v1 ([§13](#13-phasing)).
-
----
-
-## 1. The problem and the principles
-
-The ratio of jobs to engineers creates five risks:
-
-- **Blast radius.** One library release, schema change or changed default reaches every job at
-  once. A bad release could fail hundreds of tasks, or silence every alert.
-- **Attention.** Nobody can review hundreds of jobs by hand. A control that needs a person to look
-  at each job won't happen.
-- **Trust.** Noisy alerts and wrong verdicts get ignored quickly, and then the real ones are
-  ignored too.
-- **Drift.** Without strong defaults, every job ends up configured a little differently:
-  different SLAs, severities, rules and library versions.
-- **Bus factor.** A custom library maintained by two or three people has to survive one of them
-  leaving.
-
-**Principles:**
-
-1. **Govern by default, not by meeting.** Standards live in the bundle template, the manifest and
-   CI. A job that uses the template is compliant without anyone reviewing it.
-2. **Strict where the blast radius is, light everywhere else.** Contracts that every job depends
-   on get formal change control. Everything else is a normal PR.
-3. **Proportional to criticality.** A few critical jobs get the full treatment. The long tail gets
-   zero-code coverage (rung 0) and nothing more is required of it.
-4. **Measure with the ledger itself.** The `rl_*` tables already know which jobs are owned,
-   instrumented, validated and noisy. A scorecard view replaces audits.
-
-## 2. What the design already gives us
-
-Much of the control surface already exists. This proposal leans on it rather than adding process.
-
-| Control in the design | Governance use |
+| Rule | In practice |
 |---|---|
-| `schema/tables.py` as the single source; generated DDL; CI drift check | Every schema change goes through one reviewed file |
-| `runledger.schema_version` + a minimum version per client; tables-first migration order | Hundreds of clients can upgrade safely |
-| ruff `banned-api` rule | Spark Connect compatibility can't regress silently |
-| Manifest generated from the bundle; `manifest_version` with `effective_from` / `effective_to` | An auditable history of what was expected, and when |
-| `owner`, `criticality`, `sla_max_duration` in `runledger.yml` | Ownership and tiering per job |
-| `rule_key` + `definition_hash` | Every threshold change is visible in the data |
-| `effective_policy` stored on every result | Proof of whether a rule was enforced, trialled or muted |
-| `context_sources` and config provenance | Proof of where each setting came from |
-| Shadow mode, the canary, `reconcile explain` | New jobs can't page anyone until their verdicts are trusted |
-| The template's dependency, and the bundle mutator (v1) | One place to pin the library version for the fleet |
-| Tables never auto-created; setup runs as a privileged principal | Only admins change structure |
+| **Defaults, not reviews** | A job that uses the template is compliant. Nobody has to sign it off. |
+| **Strict only where a change hits every job** | Table columns, key formats, the Python API: two approvals. Everything else: a normal PR. |
+| **Effort matches importance** | `high` jobs get everything. `low` jobs need almost nothing. |
+| **Measure with our own tables** | One scorecard query instead of audits. |
 
-The gaps this proposal fills are listed in [§11](#11-proposed-changes-to-the-design).
+**Do these five before the pilot:**
 
-## 3. Roles
+1. Name the owners → [§2](#2-who-does-what)
+2. Let CI spot risky changes → [§3](#3-changing-runledger)
+3. Pin one library version and roll it out in stages → [§4](#4-releases-and-rollout)
+4. Define job tiers and check them in CI → [§5](#5-job-tiers)
+5. Set permissions and write the emergency runbook → [§4](#emergency-switches), [§7](#7-permissions-and-data)
 
-With a small team these are hats, not headcount. One person can wear several, but each hat has a
-named holder.
+### Words used here
 
-| Role | Held by | Responsible for |
-|---|---|---|
-| **Product owner** | one named person, plus a deputy | The final call on *Decided* items and phase gates; MVP scope; accepting contract changes |
-| **Maintainers** | at least two people | Library and template code, releases, schema migrations. Two, so that no release or review depends on one person |
-| **Platform on-duty** | a weekly rotation among maintainers | Platform alerts (canary, reconciler, delivery); triage of noisy alerts; emergency kill switches |
-| **Job owner** | the `owner` in the manifest (a team or a person) | The job's SLA, criticality, suites and thresholds; responding to its alerts |
-| **Data owner** (optional) | whoever owns a published dataset | Approving `critical` rules on that dataset. Matters if stewards own thresholds (Q-V3) |
-
-Today *Decided* in the decision log means "set by the product owner", but nobody is named.
-
-Q-O3 asks who owns the shared schema and the reconciler. Proposal: the maintainers, deployed
-centrally once per environment, not once per team.
-
-## 4. Change control
-
-### 4.1 Three classes of change
-
-| Class | Covers | Needs |
-|---|---|---|
-| **1 · Contract** | Table and view schemas. Key formats (`run_key`, `slot_key`, `rule_key`) and the `definition_hash` formula. Status, outcome, verdict and severity values. The public Python API. Config keys, `RUNLEDGER_*` env vars and the `runledger_ctx` format. The CLI. Rule serialization (`to_dict`). The `runledger.yml` and manifest formats | A decision-log entry, an update to design.md, approval by two maintainers, a compatibility and migration note, a release note |
-| **2 · Default** | Defaults that change behaviour without any change in the jobs: severity policy, flush time budget, retry counts, shadow period, the redaction key list, which log levels are bridged, alert thresholds | One approval and a release note. A default that would make more jobs fail or page ships as opt-in for one minor release first |
-| **3 · Internal** | Everything else | Normal PR review |
-
-**Make the class mechanical, not a judgment call.** Contracts get golden snapshot tests in
-`tests/contracts/`:
-- the table specs and view columns
-- every enum
-- `to_dict()` output for each rule type
-- `definition_hash` and `rule_key` for a fixed set of rules
-- the config key list and env var names
-- `runledger --help`
-
-A PR that changes a snapshot is class 1 by definition. CODEOWNERS requires two maintainers on
-`tests/contracts/` and `src/lakehouse_runledger/schema/`.
-
-### 4.2 Decision records
-
-- Keep the decision log in [review-brief.md §3](review-brief.md#3-decision-log) until the review
-  closes. Then give each decision a short record in `docs/decisions/NNNN-title.md` (context,
-  decision, consequences, *revisit if*) and keep §3 as the index.
-- Add an owner and a date to every decision.
-- The *Revisit if* column is the right idea. Check its triggers at the quarterly review
-  ([§10](#10-cadence)) rather than relying on someone remembering.
-
-### 4.3 Phase gates
-
-Each phase ends with a go/no-go by the product owner against written exit criteria:
-
-| Gate | Exit criteria |
+| Term | Meaning |
 |---|---|
-| Phase 0 → MVP | Every spike item and every claim in [review-brief §12](review-brief.md#12-platform-claims-to-settle-in-the-design-review) is settled in `platform-notes.md` or has its fallback chosen. D10 is decided |
-| MVP → pilot in prod | Test tiers 1–3 green. Canary green for 7 days in dev. Shadow-mode verdicts on the pilot jobs reviewed, with no unexplained false positives |
-| Pilot → fleet rollout | Pilots on runledger for 2+ weeks. No task failures caused by the library. Delivery completeness and false-verdict rate within the platform SLOs ([§8.3](#83-platform-slos)). A runbook for every alert |
-| Each release | The release checklist ([§5.3](#53-release-rings)) |
+| **Tier** | How important a job is: `high`, `medium` or `low`. Set as `criticality` in `runledger.yml`. |
+| **Contract** | Anything jobs or saved queries depend on: table columns, key formats, status values, the Python API, env vars. |
+| **Snapshot test** | A test that saves a contract to a file. If a PR changes that file, a contract changed. |
+| **Trial check** | A data check that runs and records results, but can't fail a job or send an alert. |
+| **On-duty** | The maintainer handling runledger's own alerts this week. |
+| **Manifest** | The list of jobs and tasks we expect to run, built from the bundle. |
+| **Reconciler** | The scheduled job that compares the manifest with what actually ran. |
 
-**Scope control.** The MVP grew after review round 1 ([review-brief §5](review-brief.md#5-where-im-least-confident-please-push-on-these),
-item 6). A feature enters a phase only if a named pilot job needs it, or it closes a correctness or
-trust gap. Everything else waits on the *Later* list. For a small team, the maintenance cost of
-what we build is a governance concern too; it is part of the D10 decision.
+## 1. Why we need this
 
-## 5. Versions, compatibility and rollout
+| Risk | What it looks like |
+|---|---|
+| One change hits every job | A bad release breaks 300 tasks overnight |
+| Too many jobs to check by hand | 300 jobs × 5 min = 25 hours, every review cycle |
+| Noisy alerts get ignored | 20 false "missed run" alerts a day, so the real one is missed |
+| Jobs drift apart | Five different SLAs for the same kind of job; three library versions in prod |
+| Knowledge in one head | Only one person knows how to release |
 
-### 5.1 Versioning
+Much of the fix is already in the design. We just use it on purpose:
 
-- **Library:** semantic versioning. Before 1.0 a minor release may break a contract, but it still
-  follows the deprecation rule below.
-- **Schema:** `runledger.schema_version` is an integer, separate from the library version. Within
-  a major version, schema changes are additive only. Never rename, retype or drop a column: add a
-  replacement beside it, and drop the old one only in a major release.
-- **Views are the read contract.** Dashboards, alerts and saved queries read `rl_v_*` views, not
-  base tables. A view can absorb a table change; hundreds of saved queries can't. (The alert
-  example in [features.md H6](features.md#h6-databricks-sql-alerts-v1-one-alert-in-mvp) reads
-  `rl_validation_results` directly; it should read a view.)
-- **Deprecation:** anything removed is deprecated for at least one minor release first. A
-  deprecated call logs one WARN event per run and shows in `runledger doctor`.
-- **Support window:** the latest two minor versions. The scorecard lists jobs on anything older.
+| Already in the design | What it gives us |
+|---|---|
+| `schema/tables.py` + generated DDL + CI drift check | All schema changes go through one reviewed file |
+| Manifest built from the bundle, with versions and dates | A history of what we expected to run, and when |
+| `rule_key` + `definition_hash` | Every threshold change shows up in the data |
+| `effective_policy` on every validation result | Proof that a check was enforced, on trial or switched off |
+| Shadow mode, canary, `reconcile explain` | New jobs can't page anyone until their verdicts are trusted |
 
-### 5.2 One pinned version for the fleet
+## 2. Who does what
 
-- The template's dependency (and the bundle mutator, in v1) installs
-  `lakehouse-runledger==${var.runledger_version}`. Upgrading every job in a target is one variable
-  change in a reviewed PR. Rolling back is a revert.
-- A job may pin its own version, but the scorecard shows it.
-- Record the library version on every `rl_task_runs` row, in a new `client_version` column. Today
-  only validation results record it, inside `scope`. With the column, "which jobs run which
-  version" is one query.
-
-### 5.3 Release rings
-
-| Ring | Who | Soak |
+| Role | Who | Owns |
 |---|---|---|
-| 0 | The canary job and the Tier 4 integration suite (`-t it`) | must pass |
-| 1 | Pilot jobs in prod | 3–7 days |
-| 2 | All dev and test targets | 1–3 days, can overlap ring 1 |
-| 3 | All prod targets | — |
+| **Product owner** | 1 person + a deputy | Final decisions, scope, sign-off at each phase |
+| **Maintainers** | at least 2 people | Library, template, releases, schema changes |
+| **On-duty** | weekly rotation of maintainers | runledger's own alerts, emergency switches |
+| **Job owner** | `owner` in `runledger.yml` | The job's tier, SLA, data checks and alerts |
+| **Data owner** *(optional)* | owner of a published dataset | Approves `critical` checks on that dataset |
 
-Schema migrations run before ring 0: tables first, then clients, as the design already says.
+One person can hold several roles, but every role needs a name.
 
-**Release checklist:**
-- the contract snapshot diff is reviewed
-- compatibility tests are green: client N−1 against schema N, and client N against schema N
-- the release notes list every class 1 and class 2 change
-- rollback (reverting `runledger_version`) has been tested
+**Where an alert goes:**
 
-### 5.4 Kill switches
+```mermaid
+flowchart LR
+  A["Alert fires"] --> B{"About<br/>runledger<br/>itself?"}
+  B -->|"yes: canary, reconciler, delivery"| P["On-duty maintainer"]
+  B -->|"no: a job or a data check"| O["Job owner<br/>from the manifest"]
+  O --> T{"Job<br/>tier"}
+  T -->|high| H["On-call channel, any hour"]
+  T -->|medium| M["Team channel, business hours"]
+  T -->|low| L["Dashboard only"]
+```
 
-When something goes wrong across the fleet, the switches and the authority to flip them should be
-agreed in advance.
+## 3. Changing runledger
 
-| Switch | Effect | Who may flip it in prod | How it is recorded |
+Every PR is one of three types. Files decide the type, so nobody has to argue about it.
+
+```mermaid
+flowchart LR
+  PR["PR opened"] --> Q1{"Touches<br/>tests/contracts/?"}
+  Q1 -->|yes| C1["Contract change<br/>2 maintainer approvals<br/>+ decision log entry<br/>+ migration note"]
+  Q1 -->|no| Q2{"Touches<br/>a default?"}
+  Q2 -->|yes| C2["Default change<br/>1 approval + release note"]
+  Q2 -->|no| C3["Internal change<br/>normal review"]
+```
+
+Defaults live in `config.py` and the alert SQL, so CODEOWNERS can flag them too.
+
+| Example | Type |
+|---|---|
+| Rename `failed_rows` to `bad_rows` | Contract |
+| Add a new verdict `LATE` | Contract |
+| Change how `rule_key` is generated | Contract |
+| Flush time limit 30 s → 20 s | Default |
+| Shadow period 7 → 14 days | Default |
+| Add `password` to the redaction list | Default |
+| Refactor the write buffer | Internal |
+
+- **Snapshot tests cover:** table and view columns, every status and verdict value, `to_dict()` for
+  each rule type, `rule_key` and `definition_hash` for a fixed set of rules, config keys, env vars
+  and `runledger --help`.
+- **CODEOWNERS** requires two maintainers on `tests/contracts/` and `schema/`.
+- **A default that would make more jobs fail or alert** ships switched off for one release first.
+
+### Decisions
+
+Every decision gets an owner and a date. After the design review, each one gets a one-page file:
+
+```markdown
+# 0007 · Dashboards and alerts read views, never tables
+- Status: Decided · Owner: <name> · Date: 2026-12-01
+- Decision: dashboards, alerts and saved queries read rl_v_* views only.
+- Why: a view can absorb a table change; 300 saved queries can't.
+- Revisit if: a view gets too slow for the dashboard.
+```
+
+The quarterly review checks every *Revisit if* line.
+
+### Phase gates
+
+```mermaid
+flowchart LR
+  P0["Phase 0<br/>spike"] --> G1{{"Gate 1"}} --> MVP["Build<br/>MVP"] --> G2{{"Gate 2"}} --> PI["Pilot<br/>in prod"] --> G3{{"Gate 3"}} --> F["All<br/>jobs"]
+```
+
+The product owner signs off each gate when every box is ticked:
+
+| Gate | Pass when |
+|---|---|
+| **1** | ☐ Every spike item settled or its fallback chosen ☐ D10 (build or wrap DQX) decided |
+| **2** | ☐ Test tiers 1–3 green ☐ Canary green for 7 days in dev ☐ Pilot jobs' shadow verdicts checked, no unexplained false alarms |
+| **3** | ☐ 2+ weeks on pilots with 0 failures caused by runledger ☐ Health targets met ([§8](#8-health-and-alerts)) ☐ A runbook for every alert |
+
+A feature joins a phase only if a pilot job needs it or it fixes a correctness problem. Everything
+else waits on the *Later* list.
+
+## 4. Releases and rollout
+
+### Schema: add columns, never break them
+
+```sql
+-- ✅ Fine in any release: add a nullable column
+ALTER TABLE ops_prod.runledger.rl_task_runs ADD COLUMNS (client_version STRING);
+
+-- ❌ Major release only, after a deprecation period
+ALTER TABLE ops_prod.runledger.rl_validation_results RENAME COLUMN failed_rows TO bad_rows;
+```
+
+### Views are what people read
+
+```mermaid
+flowchart LR
+  subgraph CAN["Can change"]
+    T[("rl_* tables<br/>add columns only")]
+  end
+  subgraph STABLE["Kept stable"]
+    V["rl_v_* views"]
+  end
+  T --> V
+  V --> D["Dashboards"]
+  V --> A["SQL alerts"]
+  V --> Q["Saved queries"]
+```
+
+The alert example in [features.md H6](features.md#h6-databricks-sql-alerts-v1-one-alert-in-mvp)
+reads a table directly. It should read a view.
+
+### One pinned version for all jobs
+
+```yaml
+# databricks.yml
+variables:
+  runledger_version: {default: "0.3.2"}
+targets:
+  prod:
+    variables: {runledger_version: "0.3.1"}   # prod stays one step behind until the pilots pass
+
+# each job (or injected by the bundle mutator in v1)
+environments:
+  - environment_key: default
+    spec:
+      dependencies: ["lakehouse-runledger==${var.runledger_version}"]
+```
+
+- Upgrade = change one line. Roll back = revert it.
+- New `client_version` column on `rl_task_runs`, so "which jobs run which version" is one query.
+- We support the latest two minor versions. Anything removed logs a warning for one release first.
+
+### Rollout stages
+
+```mermaid
+flowchart LR
+  M["1 · Add new columns<br/>to tables"] --> S0["2 · Canary + integration tests<br/>must pass"]
+  S0 --> S1["3a · Pilot jobs in prod<br/>3–7 days"]
+  S0 --> S2["3b · All dev and test<br/>1–3 days"]
+  S1 --> S3["4 · All prod jobs"]
+  S2 --> S3
+```
+
+**Release checklist**
+- [ ] Contract snapshot changes reviewed
+- [ ] Old library works with the new tables, and so does the new library
+- [ ] Release notes list every contract and default change
+- [ ] Rollback tested
+
+### Emergency switches
+
+```mermaid
+flowchart TD
+  X["Something is wrong across many jobs"] --> A{"What is happening?"}
+  A -->|"jobs fail because of runledger"| R["Roll back runledger_version"]
+  A -->|"Delta writes slow or failing"| S["RUNLEDGER_SINKS=stdlog"]
+  A -->|"a data check wrongly fails jobs"| E["RUNLEDGER_VALIDATION_ENFORCE=false"]
+  A -->|"false missing-run alerts"| H["Put reconciler alerts<br/>back in shadow mode"]
+```
+
+| Switch | Who can flip it in prod | Where it shows afterwards |
+|---|---|---|
+| Roll back `runledger_version` | On-duty | `client_version` |
+| `RUNLEDGER_SINKS=stdlog` | On-duty | Gaps in `rl_v_delivery_completeness` |
+| `RUNLEDGER_VALIDATION_ENFORCE=false` | On-duty during an incident; otherwise a PR | `effective_policy` on every result |
+| `RUNLEDGER_VALIDATION_EVALUATE=false` | PR only | The "dataset not validated in 24h" alert |
+| Reconciler alerts → shadow mode | On-duty | Reconciler config in the bundle |
+
+Every emergency flip gets a follow-up PR within one business day, to undo it or make it permanent.
+
+> **Open (G-Q5):** flipping a switch for every job means redeploying every bundle. With many
+> bundles that is slow during an incident. Alternative: a small settings file on a UC Volume that
+> every job reads at start-up.
+
+## 5. Job tiers
+
+| | `high` | `medium` | `low` *(default)* |
 |---|---|---|---|
-| `RUNLEDGER_SINKS=stdlog` | Stops all Delta writes; logs go to the driver log only | On-duty, without waiting for review | `context_sources`; the gap shows in delivery completeness |
-| `RUNLEDGER_VALIDATION_ENFORCE=false` | Validation keeps recording but never fails a task | On-duty during an incident; otherwise a reviewed PR | `effective_policy` on every result |
-| `RUNLEDGER_VALIDATION_EVALUATE=false` | Skips validation entirely | Reviewed PR only | `effective_policy`; the "dataset not validated in 24h" alert fires |
-| Reconciler alerts back to shadow mode | Stops paging on verdicts | On-duty | Reconciler config in the bundle |
-| Previous `runledger_version` | Rolls back the library | On-duty | Bundle variable history; `client_version` |
+| Listed in the manifest | ✅ | ✅ | ✅ |
+| Owner | ✅ | ✅ | ✅ (bundle default is fine) |
+| SLA and grace period | ✅ | ✅ | — |
+| Code changes | `@rl.task` + `@rl.step` on publish steps | `@rl.task` or the one-line import | none |
+| Data checks | enforced suite\* | trial suite | — |
+| Alerts | on-call, any hour | team channel, business hours | dashboard only |
 
-An emergency flip needs a follow-up PR within one business day that either reverts it or makes it
-permanent.
-
-**Open (G-Q5):** these switches are env vars or job parameters, so flipping one fleet-wide means
-redeploying every bundle. If the jobs live in many bundles, that is slow during an incident. An
-option is a small control file on a UC Volume, read at `init()` within the existing 1s detection
-budget, that holds fleet-wide overrides. It costs one read per task.
-
-## 6. Job standards by criticality
-
-The manifest already has `criticality`. Give its values a meaning, and keep the long tail cheap.
-
-| Requirement | `high` | `medium` | `low` (default) |
-|---|---|---|---|
-| In a manifest (bundle or `manifest add`) | required | required | required |
-| `owner` | required | required | required (a bundle-level default is fine) |
-| SLA and grace | required | required | optional |
-| Instrumentation | rung 2+, with `@rl.step` on publish steps | rung 2+ | rung 0 is enough |
-| Validation of published datasets | an enforced suite with at least: schema contract, `row_count(min=…)`, `not_null` and `unique` on keys | a suite, in trial mode at least | none required |
-| Gating consumers | write-audit-publish (v1) where downstream jobs read the data | — | — |
-| Alerts | the on-call channel, any hour | the team channel, business hours | dashboard only |
-| Shadow period | 7 days | 7 days | 7 days |
-
-The alert rows depend on Q-O1 and Q-O2.
-
-**Checked in CI, not in review.** A new `--strict` flag on `runledger manifest build` runs on
-every bundle PR. It fails when:
-- a job has no owner after defaults are applied
-- a `high` or `medium` job has no SLA or grace
-- a `high` job lists no `expected_datasets`
-- an `exclude` has no `reason`
-- a waiver has expired
-
-**Default criticality.** Unclassified jobs default to `low`, so onboarding hundreds of existing
-jobs doesn't wait on classifying them. The trade-off is that an unclassified critical job gets no
-alerts. The scorecard lists every job still on the default so they get classified over time
-(G-Q4).
-
-**Waivers.** A job that can't meet its tier yet gets a waiver in `runledger.yml`, with a reason,
-an owner and an expiry date. An expired waiver fails `--strict`.
+\* At least: schema contract, `row_count(min=…)`, and `not_null` + `unique` on key columns.
 
 ```yaml
 # runledger.yml
-defaults: {grace_minutes: 30, owner: data-eng, criticality: low}
+defaults: {owner: data-eng, criticality: low, grace_minutes: 30}
+
 jobs:
   orders_daily:
     criticality: high
     sla_max_duration_minutes: 90
     tasks:
       publish: {expected_datasets: [main.silver.orders]}
-    waivers:
-      - {requirement: enforced_suite, reason: "thresholds being tuned", owner: data-eng, expires: 2027-01-15}
+    waivers:                     # new: a temporary exception, with an end date
+      - {requirement: enforced_suite, reason: "tuning thresholds", expires: 2027-01-15}
 ```
 
-**Prod deploys come from CI only.** `runledger manifest sync` runs at deploy time, so a deploy
-from a laptop would record a manifest that matches no commit.
+CI blocks the PR when a job doesn't meet its tier *(proposed output)*:
 
-## 7. Data quality rule governance
+```text
+$ runledger manifest build --strict
+✗ orders_daily    high job has no sla_max_duration_minutes
+✗ prices_eod      exclude has no reason
+✗ risk_snapshot   waiver "enforced_suite" expired on 2027-01-15
+3 problems. Fix them, or add a waiver with an end date.
+```
 
-### 7.1 Rule lifecycle
+- **Unclassified jobs default to `low`**, so onboarding 300 existing jobs doesn't wait on
+  classifying them. The scorecard lists them until someone does (G-Q4).
+- **Prod deploys run from CI on `main` only.** The manifest is synced at deploy time, so a deploy
+  from a laptop would record a manifest that matches no commit.
 
-| Stage | Policy | Leaves the stage when |
-|---|---|---|
-| **Trial** | `evaluate` on, `enforce` off, `notify` off | 7 days or 10 runs, whichever is later, and its failures have been reviewed |
-| **Enforced** | `enforce` on, `notify` on | the rule is retired |
-| **Retired** | removed from the suite | its history stays under its `rule_key` |
+## 6. Data checks
 
-- A new rule, or a tighter threshold on an enforced rule, starts in trial. A looser threshold can
-  go straight to enforced.
-- A rule in trial for more than 30 days is flagged: promote it or delete it.
-- `critical` halts downstream work. It needs a one-line justification in the rule's description,
-  and the data owner's approval where there is one.
+```mermaid
+stateDiagram-v2
+  [*] --> Trial: new check
+  Trial --> Enforced: 7 days and 10 runs, reviewed
+  Enforced --> Trial: threshold tightened
+  Trial --> Retired: not useful
+  Enforced --> Retired: removed
+  Retired --> [*]
+```
+
+| Stage | Runs? | Can fail the job? | Can alert? |
+|---|---|---|---|
+| Trial | ✅ | — | — |
+| Enforced | ✅ | ✅ | ✅ |
+| Retired | — | — | — (history kept under its `rule_key`) |
+
+```python
+# New checks go in a trial suite: they run and record, but never fail the job or alert
+orders_trial = rl.Suite(
+    name="orders_silver_trial", dataset="main.silver.orders",
+    policy=rl.ValidationPolicy(enforce=False, notify=False),
+    rules=[c.in_range("amount", min=0, max=1_000_000, key="orders.amount.range")],
+)
+
+# Enforced checks: error and critical rules always set an explicit key
+orders_suite = rl.Suite(
+    name="orders_silver", version="4", dataset="main.silver.orders",
+    rules=[c.unique("order_id", key="orders.order_id.unique", severity="critical")],
+)
+```
+
+- **Explicit `key`** on `error` and `critical` checks, named `<dataset>.<column>.<check>`. A
+  generated key changes when a column is renamed, and that splits the check's history in two.
+- **`critical` stops downstream tasks.** Say why in the PR; the data owner approves.
+- **Loosening** a threshold can skip trial. **Tightening** can't.
+- **On trial for 30+ days?** Promote it or delete it:
 
 ```sql
--- Rules still in trial (enforce off) after 30 days
 SELECT rule_key, dataset, min(evaluated_at) AS first_seen
 FROM rl_validation_results
 GROUP BY rule_key, dataset
 HAVING min(evaluated_at) < now() - INTERVAL 30 DAYS
-   AND NOT max_by(effective_policy.enforce, evaluated_at);
+   AND NOT max_by(effective_policy.enforce, evaluated_at);   -- latest result is still on trial
 ```
 
-### 7.2 Identity and ownership
+## 7. Permissions and data
 
-- `error` and `critical` rules must set an explicit `key`. A derived key changes when a dataset or
-  column is renamed, and that splits the rule's history in two.
-- Naming convention: `<dataset_short>.<columns>.<check>`, e.g. `orders.order_id.unique`.
-- Shared suites live in one module in git (rung 5), with the job owner as CODEOWNER. A threshold
-  change is a code review; `definition_hash` then makes it visible in the data.
+**A job can report on itself, but can't change what was expected of it or the verdict about it.**
 
-## 8. Access, retention and operations
+```mermaid
+flowchart LR
+  J["Jobs<br/>group runledger-writers"] -->|append| R[("rl_task_runs · rl_events · rl_metrics<br/>rl_validation_results · rl_validation_samples")]
+  S["Setup job"] -->|append| M[("rl_manifest")]
+  C["Reconciler"] -->|append| O[("rl_slot_observations")]
+  M -.->|read| C
+  R --> V["rl_v_* views"]
+  M --> V
+  O --> V
+  V -->|SELECT| U["Engineers and quants<br/>group runledger-readers"]
+  R -.->|samples only| K["group runledger-sample-readers"]
+```
 
-### 8.1 Environments and grants
+```sql
+GRANT USE CATALOG ON CATALOG ops_prod TO `runledger-writers`;
+GRANT USE SCHEMA ON SCHEMA ops_prod.runledger TO `runledger-writers`;
+GRANT MODIFY, SELECT ON TABLE ops_prod.runledger.rl_events TO `runledger-writers`;
+GRANT SELECT ON TABLE ops_prod.runledger.rl_v_task_runs TO `runledger-readers`;
+```
 
-- One `rl_*` schema per environment catalog, for example `ops_dev.runledger` and
-  `ops_prod.runledger`, so dev jobs can't write to the prod ledger. Q-E1 decides the layout across
-  workspaces.
-- Grant to groups, never to individuals:
+- **One catalog per environment** (`ops_dev`, `ops_prod`), so dev jobs can't write to the prod ledger.
+- **Grant to groups**, never to individuals.
 
-| Group or principal | Grants | Why |
+`MODIFY` also allows updates and deletes (claim C7). Two cheap guards:
+
+| Guard | How |
+|---|---|
+| **Detect** | Weekly, run `DESCRIBE HISTORY` on each table and flag anything that isn't an append, `OPTIMIZE` or the retention job |
+| **Prevent** (only if Q-G1 needs tamper-proof records) | `SET TBLPROPERTIES ('delta.appendOnly' = 'true')` on runs, results, manifest and observations. Test it in the Phase 0 spike first |
+
+**How long we keep data** (until Q-G1 and Q-G2 are answered):
+
+| Table | Keep | Who can read |
 |---|---|---|
-| `runledger-admins` | owns the schema; runs setup, migrations and maintenance | Only admins change structure or delete rows |
-| `runledger-writers` (the job run-as principals) | `MODIFY` on `rl_task_runs`, `rl_events`, `rl_metrics`, `rl_validation_results`, `rl_validation_samples` | Jobs report their results |
-| the setup job's principal | `MODIFY` on `rl_manifest` | Only a deploy declares what is expected |
-| the reconciler's principal | `SELECT` on `rl_manifest` and the system tables; `MODIFY` on `rl_slot_observations`; read access to Jobs | Only the reconciler draws conclusions |
-| `runledger-readers` | `SELECT` on the `rl_v_*` views | Everyone reads through the contract |
-| `runledger-sample-readers` | `SELECT` on `rl_validation_samples` | Samples may hold PII |
+| Runs, validation results, observations, metrics | 13 months (allows year-over-year) | all readers |
+| `rl_events` | 90 days | all readers (sensitive keys redacted) |
+| `rl_validation_samples` | 14 days | restricted group only |
+| `rl_manifest` | forever (it is small) | all readers |
 
-Writers get no access to `rl_manifest` or `rl_slot_observations`. A job can report on itself, but
-it can't change what was expected of it or the verdict about it.
+Failing-row samples are off in prod unless `sample_columns` lists which columns may be stored.
 
-**`MODIFY` isn't write-only** (claim C7, Q-G6). With one team on shared tables that is acceptable,
-given two cheap controls:
-- **Detect.** A weekly check of `DESCRIBE HISTORY` on each `rl_*` table flags any operation other
-  than appends, `OPTIMIZE` and the maintenance job's deletes. The design is append-only, so
-  anything else is a mistake or worse.
-- **Prevent, if Q-G1 requires immutable evidence.** Set `delta.appendOnly = true` on
-  `rl_task_runs`, `rl_validation_results`, `rl_manifest` and `rl_slot_observations`. Retention on
-  those tables then means lifting the property inside the maintenance job, or keeping everything
-  (they are small). Add to the Phase 0 spike: check that the property works with liquid clustering
-  and predictive optimization.
+## 8. Health and alerts
 
-Per-team schemas with union views are worth it only if a second team with different data
-permissions adopts runledger.
+**Health targets for runledger itself** (the on-duty maintainer watches these):
 
-### 8.2 Retention and classification
+| Target | Goal |
+|---|---|
+| Canary last ran | < 30 min ago |
+| Reconciler last ran | < 30 min ago |
+| Rows delivered to the tables | ≥ 99.9% per day |
+| Job failures caused by runledger | 0 |
+| Alerts later proven wrong | < 1% per week |
 
-Starting points until Q-G1 and Q-G2 are answered:
+**Alert rules:**
+- One SQL alert per destination, filtered by owner and tier.
+- Every alert links a runbook. Step 1 is always `runledger reconcile explain <slot_key>` or the
+  failing `rule_key`.
+- An alert that fires 3+ times in a week with no action gets its SLA or threshold reviewed.
 
-| Table | Retention | Classification |
+## 9. The scorecard
+
+One view, `rl_v_governance_scorecard`, and one dashboard page. An example of what it would show:
+
+| Check | This week | Target |
 |---|---|---|
-| `rl_task_runs`, `rl_validation_results`, `rl_slot_observations`, `rl_metrics` | 13 months | internal |
-| `rl_events` | 90 days | internal; free text may hold sensitive data, so redaction applies |
-| `rl_validation_samples` | 14 days | restricted |
-| `rl_manifest` | all versions | internal |
+| Prod jobs in no manifest | 3 | 0 |
+| Jobs still on the default tier | 212 | going down |
+| `high` / `medium` jobs with no SLA | 4 | 0 |
+| `high` jobs with no runledger code | 1 | 0 |
+| `high` datasets not validated in 24h | 0 | 0 |
+| Checks on trial for 30+ days | 6 | 0 |
+| Checks that errored in the last 7 days | 2 | 0 |
+| Jobs on an unsupported library version | 9 | 0 |
+| Expired waivers | 1 | 0 |
+| Unexpected updates or deletes on `rl_*` | 0 | 0 |
+| Most alerts for one job this week | 5 | ≤ 3 |
 
-- Thirteen months allows year-over-year comparison of quality trends.
-- Every table is tagged in UC with `owner` and `classification`.
-- The redaction key list is a class 2 default. Adding a key is cheap; removing one needs review.
-- Samples are off in prod unless `sample_columns` is set. Later: automatically exclude columns
-  that carry a PII tag in UC.
+The first row matters most: it is the only way to catch jobs created outside a bundle.
 
-### 8.3 Platform SLOs
-
-The maintainers own the platform's health, separately from any job's.
-
-| SLO | Target | Source |
-|---|---|---|
-| Canary freshness | < 30 min | canary job |
-| Reconciler freshness | < 30 min | `rl_slot_observations` |
-| Delivery completeness | ≥ 99.9% of rows per day | `rl_v_delivery_completeness` |
-| Task failures caused by the library | 0 | `rl_v_failure_groups` where the top frame is in `lakehouse_runledger`, plus any jump in `FAILED_BEFORE_INIT` after a release |
-| Verdicts that alerted and were later superseded | < 1% of alerting slots per week | `rl_slot_observations.supersedes` |
-
-### 8.4 Alerts
-
-- **Route by owner and criticality.** One SQL Alert per destination, filtered on the manifest's
-  `owner` and `criticality`, instead of one shared destination. For a small team that is a handful
-  of alerts. If owners grow past a handful, that is the trigger to revisit D3 and route in a
-  `Notifier`.
-- **Every alert links a runbook.** The first step is `runledger reconcile explain <slot_key>` or
-  the failing `rule_key`.
-- **Noise budget.** An alert that fires more than three times in a week with no action taken gets
-  a review of that job's SLA, grace or thresholds at the weekly on-duty review.
-
-## 9. Measuring it: the scorecard
-
-Add a view, `rl_v_governance_scorecard`, and a dashboard page:
-
-| Metric | Computed from | Target |
-|---|---|---|
-| Prod jobs in no manifest | `system.lakeflow.jobs` anti-joined with `rl_manifest` | 0 |
-| Jobs on the default criticality | `rl_manifest` | trending down |
-| `high` and `medium` jobs with no SLA | `rl_manifest` | 0 |
-| `high` jobs uninstrumented | `rl_v_expected_vs_actual`, verdict `UNINSTRUMENTED` | 0 |
-| `high` expected datasets with no enforced result in 24h | `rl_manifest.expected_datasets` × `rl_validation_results` | 0 |
-| Rules in trial for more than 30 days | the [§7.1](#71-rule-lifecycle) query | 0 |
-| Rules with an `ERROR` outcome in the last 7 days | `rl_validation_results` | 0 |
-| Jobs on unsupported library versions | `rl_task_runs.client_version` | 0 |
-| Expired waivers | `rl_manifest` | 0 |
-| Non-append operations on `rl_*` tables | the Delta history check | 0 unexplained |
-| Alerts per job per week | alert history | within the noise budget |
-
-The first metric matters most. It is the only one that catches jobs created outside a bundle,
-which the rest of the system can't see.
-
-## 10. Cadence
+## 10. Calendar
 
 | When | Who | What | Time |
 |---|---|---|---|
-| Every PR | CI | DDL drift, the banned-API rule, contract snapshots, compatibility tests, `manifest build --strict` | — |
-| Weekly | on-duty | Platform alerts, noisy alerts, non-append operations | 15 min |
-| Monthly | maintainers and job owners | The scorecard: promote or delete trial rules, classify jobs, close waivers | 30 min |
-| Quarterly | product owner and maintainers | *Revisit if* triggers, the support window, retention, SLOs | 45 min |
-| Each release | maintainers | Release checklist and rings ([§5.3](#53-release-rings)) | — |
+| Every PR | CI | DDL drift, banned APIs, contract snapshots, compatibility tests, `manifest build --strict` | automatic |
+| Weekly | On-duty | runledger alerts, noisy alerts, unexpected writes | 15 min |
+| Monthly | Maintainers + job owners | Scorecard: promote or delete trial checks, classify jobs, close waivers | 30 min |
+| Quarterly | Product owner + maintainers | *Revisit if* lines, supported versions, retention, health targets | 45 min |
+| Each release | Maintainers | Release checklist and rollout stages | — |
 
-## 11. Proposed changes to the design
+## 11. Open questions
 
-| # | Change | Where | Phase |
-|---|---|---|---|
-| 1 | Name the product owner and two maintainers; add owner and date to the decision log | review-brief §3 | now |
-| 2 | CODEOWNERS and contract snapshot tests | repo, `tests/contracts/` | MVP (implementation step 1) |
-| 3 | `client_version` column on `rl_task_runs` | design › Data model | MVP (cheaper before the first table exists) |
-| 4 | `runledger_version` bundle variable; release rings | design › DAB template | MVP; the mutator pins it in v1 |
-| 5 | The grants model in `03_grants.sql`, with separate principals for setup and the reconciler | design › DAB template, Risks | MVP |
-| 6 | Defined `criticality` values; `owner` required with a bundle default; `manifest build --strict` | features G1 | MVP |
-| 7 | Alerts and dashboards read views only; fix the H6 example | features H6 | MVP |
-| 8 | A written kill-switch runbook | new `docs/runbooks/` | before the pilot |
-| 9 | Waivers with expiry dates in `runledger.yml` | features G1 | v1 |
-| 10 | `rl_v_governance_scorecard` and a dashboard page | features H3, H5 | v1; the unmanaged-jobs metric fits the MVP coverage view |
-| 11 | Alert routing by owner and criticality; runbook links in alerts | features H6 | v1 |
-| 12 | Rule lifecycle; explicit `key` for `error` and `critical` rules, enforced by a lint | features E5, E8 | convention now; lint in v1 |
-| 13 | Retention per table, UC tags, the Delta history check | features H7 | v1 |
-| 14 | `delta.appendOnly` on the evidence tables | Phase 0 spike | depends on Q-G1 |
-| 15 | A fleet control file for kill switches without a redeploy | design › Config | open (G-Q5) |
-
-## 12. Open questions for the review
-
-| # | Question | Why it matters |
+| # | Question | What the answer changes |
 |---|---|---|
-| G-Q1 | Who is the product owner, and who are the (at least two) maintainers? | Every gate and class 1 change needs a named approver |
-| G-Q2 | Does the small team own every job, or do other teams own some of them? | One team: shared tables and one alert destination are fine. Several: owner routing and Q-G6 matter more |
-| G-Q3 | Roughly how many bundles do the jobs live in? | Whether one `runledger_version` variable and redeploy-based kill switches are practical |
-| G-Q4 | Default criticality `low` (quiet, may miss an unclassified critical job) or `medium` (safer, noisier)? | Alert volume on day one |
-| G-Q5 | Kill switches by redeploy, or a fleet control file read at `init()`? | Incident response time vs one extra read per task |
-| G-Q6 | Who approves `critical` rules and thresholds: engineers or data owners? | Same as Q-V3; sets the reviewer for rule changes |
+| G-Q1 | Who is the product owner? Who are the two or more maintainers? | Every approval needs a name |
+| G-Q2 | Does our team own every job, or do other teams own some? | One team: shared tables and one alert channel are fine. Several teams: routing and Q-G6 matter more |
+| G-Q3 | Roughly how many bundles hold the jobs? | Whether one version variable and redeploy-based switches are practical |
+| G-Q4 | Default tier `low` (quiet) or `medium` (safer, noisier)? | How many alerts on day one |
+| G-Q5 | Emergency switches by redeploy, or a shared settings file? | Incident speed vs one extra read per task |
+| G-Q6 | Who approves `critical` checks: engineers or data owners? | Who reviews rule changes (same as Q-V3) |
 
-This proposal also suggests answers to existing questions, to confirm or overturn:
-- **Q-G3** (who reads): everyone reads views; samples are restricted ([§8.1](#81-environments-and-grants)).
-- **Q-G4** (job identities): grant to a writers group, whatever the run-as principals turn out to be.
-- **Q-G6** (`MODIFY` on shared tables): accept, with detection, and append-only tables if Q-G1 requires it.
-- **Q-O3** (who owns the schema and reconciler): the maintainers, deployed once per environment.
+This proposal also suggests answers to questions in [review-brief §6](review-brief.md#6-key-questions-about-our-needs-and-environment):
 
-It depends on: Q-G1 and Q-G2 (retention, immutability, classification), Q-O1 and Q-O2 (alert
-destinations and hours), Q-E1 (catalog layout), Q-E8 (share of jobs in bundles) and Q-E9 (where
-the CI checks run).
-
-## 13. Phasing
-
-Governance should grow with adoption, not ahead of it.
-
-| Phase | Governance in place |
+| Question | Proposed answer |
 |---|---|
-| **Now (design review)** | Roles named; change classes agreed; decision log has owners and dates; this document accepted or changed |
-| **Phase 0** | Spike items added: `delta.appendOnly` with liquid clustering; how fast a fleet-wide redeploy is |
-| **MVP** | Contract snapshots and CODEOWNERS; `client_version`; `runledger_version` and rings; grants model; criticality tiers and `manifest build --strict`; views as the read contract; kill-switch runbook |
-| **Pilot** | Phase gate criteria checked; weekly on-duty review starts |
-| **v1** | Scorecard; rule lifecycle lint; waivers; alert routing and runbooks; retention, tags and the history check; monthly and quarterly reviews start |
-| **Later** | Fleet control file if G-Q5 says so; automatic PII exclusion from samples; per-team schemas if a second team adopts |
+| Q-G3 · who reads the tables | Everyone reads views; samples are restricted |
+| Q-G4 · job identities | Whatever they are, grant to one writers group |
+| Q-G6 · `MODIFY` on shared tables | Accept it, with the detect and prevent guards in [§7](#7-permissions-and-data) |
+| Q-O3 · who owns the schema and reconciler | The maintainers, one deployment per environment |
+
+It depends on Q-G1, Q-G2 (retention, tamper-proofing), Q-O1, Q-O2 (alert channels and hours),
+Q-E1 (catalog layout), Q-E8 (how many jobs are in bundles) and Q-E9 (where CI runs).
+
+## 12. What gets built, and when
+
+```mermaid
+flowchart LR
+  N["Now<br/>name owners<br/>agree PR types"] --> P0["Phase 0<br/>test appendOnly<br/>time a full redeploy"]
+  P0 --> MVP["MVP<br/>snapshot tests + CODEOWNERS<br/>client_version column<br/>version variable + stages<br/>grants and tiers<br/>views-only reads<br/>emergency runbook"]
+  MVP --> PI["Pilot<br/>gate check<br/>weekly on-duty"]
+  PI --> V1["v1<br/>scorecard<br/>waivers<br/>alert routing<br/>retention + history check"]
+  V1 --> LT["Later<br/>shared settings file<br/>auto-skip PII columns<br/>per-team schemas if needed"]
+```
+
+Changes this implies in the other docs:
+
+| Change | Where |
+|---|---|
+| Owner and date on every decision | [review-brief §3](review-brief.md#3-decision-log) |
+| `client_version` column on `rl_task_runs` | [design › Data model](design.md#data-model-uc-managed-delta-one-configurable-catalogschema-prefix-rl_) |
+| `runledger_version` variable, grants file, per-environment catalogs | [design › DAB template](design.md#dab-template-bundle_template) |
+| Tier meanings, required owner, waivers, `--strict` | [features G1](features.md#g1-a-manifest-built-from-the-bundle-mvp) |
+| Alerts read views only | [features H6](features.md#h6-databricks-sql-alerts-v1-one-alert-in-mvp) |
+| Retention per table, history check | [features H7](features.md#h7-retention-and-maintenance-job-v1) |
+| `delta.appendOnly` test | [design › Roadmap, Phase 0](design.md#roadmap) |
